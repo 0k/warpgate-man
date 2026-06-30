@@ -1,0 +1,119 @@
+#+TITLE: warpgate-man
+
+Declarative manager for [[https://github.com/warp-tech/warpgate][Warpgate]]
+bastion configuration. Describe the desired state of your Warpgate servers —
+targets, target-groups, users and roles — in a single YAML file, and let
+=warpgate-man= reconcile each server to match.
+
+It ships both as:
+
+- a *command-line tool* (=warpgate-man=), and
+- a *Python library* (=wgman=) with a clean API suitable for embedding in
+  other programs (e.g. Odoo).
+
+* How it works
+
+Warpgate stores its targets, users and roles in a database, exposed through its
+HTTP *admin API* (=/@warpgate/admin/api=). =warpgate-man= talks to that API
+using an admin token and reconciles the live state with your YAML file:
+
+- *create* what is missing,
+- *update* what differs,
+- *delete* what is not declared — only when you pass =--prune=.
+
+* Installation
+
+#+begin_src sh
+uv pip install -e .
+#+end_src
+
+* Configuration
+
+See [[file:examples/wgman.yaml][examples/wgman.yaml]] for a complete, annotated
+example. In short:
+
+#+begin_src yaml
+servers:
+  - name: prod
+    url: https://warpgate.example.com:8888
+    api-key: ${WG_PROD_TOKEN}
+
+roles:
+  - name: admin
+
+target-groups:
+  - name: databases
+    targets:
+      - name: pg-main
+        kind: ssh
+        host: 10.0.0.5
+        port: 22
+        username: postgres
+        auth: publickey
+        roles: [admin]
+
+users:
+  - name: alice
+    roles: [admin]
+#+end_src
+
+Secrets are referenced through environment variables (=${VAR}=) and
+interpolated at load time. Never write secrets in clear text.
+
+* Getting an admin token
+
+Start Warpgate with =--enable-admin-token= and set the =WARPGATE_ADMIN_TOKEN=
+environment variable on the server. That value is the =api-key= used by
+=warpgate-man=.
+
+* CLI usage
+
+#+begin_src sh
+# Show the delta between the YAML and the live server (no writes)
+warpgate-man --config wgman.yaml diff
+
+# Apply: create + update (no deletions)
+warpgate-man --config wgman.yaml apply
+
+# Apply and delete anything on the server not present in the YAML
+warpgate-man --config wgman.yaml apply --prune
+
+# Target a single server from a multi-server config
+warpgate-man --config wgman.yaml --server prod apply
+#+end_src
+
+* Library usage
+
+#+begin_src python
+from wgman import WarpgateManager, Target, Role, User
+
+mgr = WarpgateManager(url="https://warpgate.example.com:8888",
+                      api_key="...")
+
+plan = mgr.reconcile(
+    roles=[Role(name="admin"), Role(name="dba")],
+    targets=[
+        Target(name="pg-main", kind="ssh", host="10.0.0.5",
+               port=22, username="postgres", auth="publickey",
+               roles=["admin", "dba"]),
+    ],
+    users=[User(name="alice", roles=["admin", "dba"])],
+    prune=False,
+)
+print(plan)  # what was created / updated / deleted
+#+end_src
+
+You can also load a YAML file directly:
+
+#+begin_src python
+from wgman import load_config, WarpgateManager
+
+config = load_config("wgman.yaml")
+server = config.server("prod")
+mgr = WarpgateManager.from_server(server)
+mgr.reconcile_config(config, prune=False)
+#+end_src
+
+* License
+
+MIT.

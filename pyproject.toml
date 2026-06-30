@@ -1,0 +1,30 @@
+[project]
+name = "warpgate-man"
+version = "0.1.0"
+description = "Declarative manager for Warpgate bastion configuration (targets, groups, users, roles) from a YAML file."
+readme = { file = "README.org", content-type = "text/plain" }
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.27",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+warpgate-man = "wgman.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "respx>=0.21",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,84 @@
+# wgman.yaml — declarative Warpgate configuration.
+#
+# warpgate-man reads this file and synchronises one or more Warpgate servers so
+# their targets, target-groups, users and roles match what is described here.
+#
+#   warpgate-man --config wgman.yaml diff           # show what would change
+#   warpgate-man --config wgman.yaml apply          # create / update
+#   warpgate-man --config wgman.yaml apply --prune  # + delete what is not here
+#
+# Secrets must be referenced through environment variables: ${VAR}. They are
+# interpolated at load time; never write secrets in clear text in this file.
+
+# ── 1. Warpgate servers to manage ────────────────────────────────────────────
+servers:
+  - name: prod                      # logical id, used by --server prod
+    url: https://warpgate.example.com:8888
+    api-key: ${WG_PROD_TOKEN}       # Warpgate admin token (X-Warpgate-Token)
+    verify-tls: true                # optional, default true
+
+  - name: staging
+    url: https://wg-staging.example.com:8888
+    api-key: ${WG_STAGING_TOKEN}
+
+# ── 2. Desired state: targets organised in groups ────────────────────────────
+# "folders / files" structure: groups contain targets. Maps onto Warpgate's
+# native target-groups (group_id). Access is granted through roles, not groups
+# (groups are purely organisational / UI).
+target-groups:
+  - name: databases
+    color: info                     # optional UI color: primary/secondary/success/danger/warning/info
+    targets:
+      - name: pg-main
+        kind: ssh                   # ssh | http | mysql | postgres | kubernetes
+        host: 10.0.0.5
+        port: 22
+        username: postgres
+        auth: publickey             # publickey | password | iam_role
+        roles: [dba, admin]         # roles allowed to reach this target
+
+      - name: mysql-reporting
+        kind: mysql
+        host: 10.0.0.6
+        port: 3306
+        username: reporting
+        auth:
+          kind: password
+          password: ${MYSQL_REPORTING_PW}
+        roles: [analysts]
+
+  - name: web-servers
+    color: success
+    targets:
+      - name: app-frontend
+        kind: http
+        url: http://10.0.1.10:8080
+        external-host: app.warpgate.example.com
+        roles: [developers]
+
+# Ungrouped targets live at the root (group_id = null).
+targets:
+  - name: jump-bastion
+    kind: ssh
+    host: 192.168.1.1
+    port: 22
+    username: root
+    auth: publickey
+    roles: [admin]
+
+# ── 3. Roles ─────────────────────────────────────────────────────────────────
+roles:
+  - name: admin
+  - name: dba
+  - name: analysts
+  - name: developers
+    default: true                   # is_default: auto-assigned to new users
+
+# ── 4. Users ─────────────────────────────────────────────────────────────────
+users:
+  - name: alice                     # → username
+    roles: [admin, dba]
+  - name: bob
+    roles: [developers]
+  - name: carol
+    roles: [analysts]
