@@ -8,24 +8,52 @@ targets, target-groups, users and roles — in a single YAML file, and let
 It ships both as:
 
 - a *command-line tool* (=warpgate-man=), and
-- a *Python library* (=wgman=) with a clean API suitable for embedding in
-  other programs (e.g. Odoo).
+- a *Python library* (=wgman=) with a clean API, synchronous and
+  dependency-light, suitable for calling from another program.
+
+The desired state does not have to be hand-written: warpgate-man can also
+*read it from an Odoo server*, turning your inventory of machines and users
+into Warpgate targets, users and roles.
+See [[*Sourcing the desired state from Odoo][the Odoo section]] below.
 
 * How it works
 
 Warpgate stores its targets, users and roles in a database, exposed through its
 HTTP *admin API* (=/@warpgate/admin/api=). =warpgate-man= talks to that API
-using an admin token and reconciles the live state with your YAML file:
+using an admin token and reconciles the live state with your desired state:
 
 - *create* what is missing,
 - *update* what differs,
-- *delete* what is not declared — only when you pass =--prune=.
+- *delete* what is not declared — only when you pass =--prune=, and even
+  then only *targets* unless you widen the scope in the =prune:= section
+  (see [[*Prune scope][Prune scope]]).
+
+** Where the desired state comes from
+
+Two sources, usable together:
+
+- the *YAML file* itself (=target-groups:=, =targets:=, =roles:=, =users:=),
+- an *Odoo server*, when the file has an =odoo:= section (or you pass
+  =--odoo-url/--odoo-db/--odoo-user=).
+
+Odoo-sourced entities are merged into the file-defined ones. A name defined
+on both sides is an error, not a silent override.
 
 * Installation
 
 #+begin_src sh
 uv pip install -e .
 #+end_src
+
+To use Odoo as a source of desired state, install the =odoo= extra, which
+pulls in the =oerpc= JSON-RPC client:
+
+#+begin_src sh
+uv pip install -e '.[odoo]'
+#+end_src
+
+Without it everything else still works; only the Odoo source raises, with a
+message telling you to install the extra.
 
 * Configuration
 
@@ -55,10 +83,31 @@ target-groups:
 users:
   - name: alice
     roles: [admin]
+    public-keys:
+      - ssh-ed25519 AAAAC3Nz... alice@laptop
 #+end_src
 
 Secrets are referenced through environment variables (=${VAR}=) and
 interpolated at load time. Never write secrets in clear text.
+
+** Prune scope
+
+=--prune= is the master switch; the optional =prune:= section says *what* it
+may delete. Without that section, =--prune= deletes *targets only* — the safe
+default, since a naive full prune would happily remove the admin user.
+
+#+begin_src yaml
+prune:
+  targets: true             # default true
+  target-groups: false      # default false
+  roles: false              # default false
+  users: false              # default false
+  keep-users: [admin]       # never deleted, even when users are pruned
+  keep-roles: [admin]
+#+end_src
+
+Each flag turns deletion on or off for one kind; each =keep-*= list protects
+individual names even when that kind is pruned.
 
 * Tokens
 
@@ -90,12 +139,127 @@ warpgate-man --config wgman.yaml diff
 # Apply: create + update (no deletions)
 warpgate-man --config wgman.yaml apply
 
-# Apply and delete anything on the server not present in the YAML
+# Apply and delete server-side targets not present in the desired state
+# (widen to other kinds with the 'prune:' section)
 warpgate-man --config wgman.yaml apply --prune
 
 # Target a single server from a multi-server config
 warpgate-man --config wgman.yaml --server prod apply
 #+end_src
+
+** Sourcing the desired state from Odoo
+
+Add an =odoo:= section and =diff= / =apply= will query that server and merge
+what it finds into the desired state, alongside whatever the file declares.
+
+#+begin_src yaml
+odoo:
+  url: https://odoo.example.com
+  db: mydb
+  user: sync@example.com
+  password: ${ODOO_PASSWORD}     # omit to be prompted interactively
+  verify-tls: true               # optional, default true
+
+  # Which machines become SSH targets, and who may reach them.
+  targets:
+    domain: [["ssh_target", "!=", false]]   # default
+    roles: [sysadmin]
+
+  # Which Odoo accounts become Warpgate users, and with which roles.
+  users:
+    - domain: [["groups_id", "in", [12]]]
+      roles: [sysadmin]
+    - domain: [["login", "=", "alice@example.com"]]
+      roles: [developers]
+#+end_src
+
+What is read, and how it maps:
+
+- *targets* — =maintenance.equipment= records matching =targets.domain=. The
+  =ssh_target= field, formatted =[user@]HOST[:PORT]= (defaulting to =root=
+  and =22=), gives host, port and backend account; the record =name= gives
+  the target name; auth is =publickey=. SSH only — Odoo describes machines,
+  not HTTP/database endpoints.
+- *users* — =res.users= records matching each =users[].domain= entry, one
+  Warpgate user per Odoo =login=. A user matching several entries
+  accumulates the roles of all of them.
+- *SSH public keys* — the =ssh.key= records belonging to those users, so
+  their keys are pushed to the bastion. Keys pasted with hard line wraps are
+  glued back together; anything that is not an OpenSSH public key is a loud
+  error, never silently uploaded.
+- *roles* — every role named in =targets.roles= or =users[].roles= is
+  auto-declared. Since access in Warpgate is "user and target share a role",
+  naming a role on both sides is all the wiring there is.
+
+Selection is expressed as *raw Odoo domains* — the same lists of
+=[field, operator, value]= triplets (with =|=, =&=, =!= operators) you would
+pass to =search_read=. They are forwarded verbatim, so any query Odoo can
+express is available.
+
+*** Previewing with =fetch=
+
+=fetch= queries Odoo and prints the result as YAML, in exactly the shape a
+config file uses — so you can read it, diff it, or paste it into a file:
+
+#+begin_src sh
+warpgate-man --config wgman.yaml fetch
+#+end_src
+
+#+begin_src yaml
+targets:
+- name: web-01
+  kind: ssh
+  host: 10.0.0.11
+  port: 22
+  username: root
+  auth: publickey
+  roles:
+  - sysadmin
+- name: db-main
+  kind: ssh
+  host: 10.0.0.12
+  port: 2222
+  username: dba
+  auth: publickey
+  roles:
+  - sysadmin
+roles:
+- name: sysadmin
+- name: developers
+users:
+- name: bob@example.com
+  roles:
+  - sysadmin
+- name: alice@example.com
+  roles:
+  - developers
+  public-keys:
+  - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB1kWyQ2 alice@laptop
+#+end_src
+
+Note =db-main= above: its =ssh_target= was =dba@10.0.0.12:2222=, which is
+where the non-default username and port come from. Note also =developers=,
+declared because a =users:= entry names it, though no target uses it yet.
+
+It writes nothing, anywhere — neither to Warpgate nor to Odoo.
+
+*** Connection details on the command line
+
+=--odoo-url=, =--odoo-db= and =--odoo-user= override the =odoo:= section, and
+together are enough to run =fetch= with no config file at all:
+
+#+begin_src sh
+warpgate-man fetch --odoo-url https://odoo.example.com \
+                   --odoo-db mydb --odoo-user sync@example.com
+#+end_src
+
+There is deliberately *no* =--odoo-password= flag: a password on the command
+line leaks into =ps= output and shell history. Put it in the config as
+=${ODOO_PASSWORD}=, or leave it out and be prompted on the terminal.
+
+Because =fetch= never contacts Warpgate, it tolerates unset =${ENV}=
+references elsewhere in the file — an unexported =WG_PROD_TOKEN= will not
+stop you from listing what Odoo holds.
 
 ** Connecting to your targets
 

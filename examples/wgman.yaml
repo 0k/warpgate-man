@@ -36,15 +36,39 @@ servers:
     api-key: ${WG_STAGING_TOKEN}
 
 # ── 1b. Optional: Odoo as source of desired state ────────────────────────────
-# When present, `warpgate-man fetch` lists SSH targets built from Odoo
-# maintenance.equipment records (those with the 'ssh_target' field set, format
-# [user@]DOMAIN_OR_IP[:PORT]), and diff/apply include them alongside the
-# targets defined in this file. CLI overrides: --odoo-url/--odoo-db/--odoo-user.
+# When present, diff/apply query Odoo and merge what they find into the state
+# described below (a name defined on both sides is an error, not an override).
+# `warpgate-man fetch` prints the same result as YAML without writing anything.
+#
+# What is read:
+#   - targets: maintenance.equipment records matching targets.domain; their
+#     'ssh_target' field ([user@]DOMAIN_OR_IP[:PORT], defaults root/22) gives
+#     host/port/account, the record name gives the target name, auth publickey.
+#   - users:   res.users records matching each users[].domain, one Warpgate
+#     user per Odoo login; roles accumulate when several entries match.
+#   - keys:    the ssh.key records of those users, pushed as their public keys.
+#   - roles:   every role named below is auto-declared (sharing a role between
+#     a user and a target is what grants access).
+#
+# Selection is expressed as raw Odoo domains, forwarded verbatim to
+# search_read. Connection overrides: --odoo-url/--odoo-db/--odoo-user. There
+# is no --odoo-password on purpose (it would leak into ps / shell history).
 #odoo:
 #  url: https://odoo.example.com
 #  db: mydb
 #  user: sync@example.com
 #  # password: ${ODOO_PASSWORD}   # omit to be prompted interactively
+#  verify-tls: true               # optional, default true
+#
+#  targets:
+#    domain: [["ssh_target", "!=", false]]    # this is the default
+#    roles: [sysadmin]                        # granted to every Odoo target
+#
+#  users:
+#    - domain: [["groups_id", "in", [12]]]    # e.g. an Odoo "sysadmins" group
+#      roles: [sysadmin]
+#    - domain: [["login", "=", "alice@example.com"]]
+#      roles: [developers]
 
 # ── 2. Desired state: targets organised in groups ────────────────────────────
 # "folders / files" structure: groups contain targets. Maps onto Warpgate's
@@ -103,6 +127,8 @@ roles:
 users:
   - name: alice                     # → username
     roles: [admin, dba]
+    public-keys:                    # optional, authorised SSH keys
+      - ssh-ed25519 AAAAC3Nz... alice@laptop
   - name: bob
     roles: [developers]
   - name: carol
@@ -110,8 +136,9 @@ users:
 
 # ── 5. Prune scope (optional) ────────────────────────────────────────────────
 # Controls what `apply --prune` (and `diff --prune`) is allowed to delete.
-# Without this section, --prune deletes TARGETS ONLY — the safe default when
-# the desired state comes from Odoo (which supplies targets, not users/roles).
+# Without this section, --prune deletes TARGETS ONLY — the safe default: a
+# full prune would happily delete the admin user the moment the desired state
+# is incomplete (e.g. an Odoo selection that matches no users).
 #
 # Each kind flag turns deletion on/off; keep-* lists protect individual names
 # even when that kind is pruned.

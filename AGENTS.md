@@ -116,8 +116,8 @@ tries the global admin token first, then the per-user `api_tokens` table.
   `models.PruneConfig`).
 - **Default (no `prune:` section): targets only.** `PruneConfig.default()`
   prunes targets and leaves target-groups / roles / users untouched — the
-  safe choice for the Odoo workflow (Odoo sources targets, not users/roles;
-  a naive full prune would wipe the admin user).
+  safe choice when the desired state is partial: a full prune would wipe the
+  admin user the moment (say) an Odoo user selection matches nothing.
 - Per-kind flags (`targets`/`target-groups`/`roles`/`users`, dash-cased in
   YAML) toggle deletion per kind; `keep-<kind>` lists protect individual
   names even when that kind is pruned (e.g. `keep-users: [admin]`).
@@ -128,19 +128,33 @@ tries the global admin token first, then the per-user `api_tokens` table.
 
 ## Odoo source (`odoo.py`)
 
-- Desired state can come from an Odoo server instead of inline YAML: the
-  config's `odoo:` section (`url`, `db`, `user`, optional `password`) or the
-  CLI overrides `--odoo-url` / `--odoo-db` / `--odoo-user`.
-- Mapping: `maintenance.equipment` records (Elabore `maintenance_server_data`
-  module) with `ssh_target` set become SSH targets. `ssh_target` format:
-  `[user@]DOMAIN_OR_IP[:PORT]` (defaults `root` / 22); the target label is the
-  equipment `name`; auth is `publickey`. SSH targets only for now — no
-  users/roles/groups from Odoo.
+- Desired state can come from an Odoo server alongside inline YAML: the
+  config's `odoo:` section (`url`, `db`, `user`, optional `password`,
+  `verify-tls`, plus the `targets:` / `users:` selections) or the CLI
+  overrides `--odoo-url` / `--odoo-db` / `--odoo-user`.
+- Selection is raw Odoo *domains* passed verbatim to `search_read`
+  (`normalize_domain` only validates shape) — no wgman-side query DSL.
+  `odoo.targets.domain` defaults to `[["ssh_target", "!=", false]]`.
+- Mapping (all three entity kinds, not targets only):
+  - **targets**: `maintenance.equipment` records (Elabore
+    `maintenance_server_data` module) matching `targets.domain`.
+    `ssh_target` format `[user@]DOMAIN_OR_IP[:PORT]` (defaults `root` / 22);
+    the target label is the equipment `name`; auth is `publickey`; roles come
+    from `targets.roles`. SSH kind only — Odoo describes machines.
+  - **users**: `res.users` matching each `users[].domain`; Warpgate username
+    = Odoo `login`; roles accumulate across matching selections.
+  - **public keys**: `ssh.key` records (Elabore addon: `user_id` + `key`) of
+    the selected users, one batched query. `normalize_public_key` unwraps
+    hard-wrapped base64 and raises on anything not OpenSSH-shaped rather than
+    pushing garbage credentials.
+  - **roles**: every role named in `targets.roles` / `users[].roles` is
+    auto-declared, so access wiring needs no separate `roles:` listing.
 - Password: config value (with `${ENV}`) or interactive `getpass` prompt on a
   TTY; no CLI flag on purpose (would leak into `ps` / shell history).
-- `fetch` prints the Odoo-sourced targets as a YAML `targets:` listing that
-  round-trips as config; `diff`/`apply` merge them into `Config.root_targets`
-  (name collisions with file targets are errors).
+- `fetch` prints the Odoo-sourced state as a YAML `targets:` / `roles:` /
+  `users:` listing that round-trips as config; `diff`/`apply` merge it via
+  `Config.merge_targets` / `merge_users` / `merge_roles` (name collisions
+  with file-defined targets or users are errors; roles are deduped silently).
 - `fetch` loads the config with `strict_env=False`: unset `${ENV}` refs used
   by other sections (e.g. the Warpgate `api-key`) don't block it; a kept
   `${...}` literal in the Odoo password is treated as unset.
