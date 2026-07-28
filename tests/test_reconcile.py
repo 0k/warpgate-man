@@ -6,21 +6,32 @@ assert on the computed Plan and the writes performed.
 
 import pytest
 
-from wgman.models import Role, Target, TargetGroup, User
+from wgman.models import PruneConfig, Role, Target, TargetGroup, User
 from wgman.reconcile import Action, Reconciler
+
+# Prune scope that enables every kind — the old default before prune became
+# targets-only. Used by tests that specifically exercise role/user pruning.
+PRUNE_ALL = PruneConfig(
+    prune_targets=True,
+    prune_target_groups=True,
+    prune_roles=True,
+    prune_users=True,
+)
 
 
 class FakeClient:
     """In-memory stand-in for WarpgateClient."""
 
     def __init__(self, *, roles=None, groups=None, targets=None, users=None,
-                 target_roles=None, user_roles=None):
+                 target_roles=None, user_roles=None, user_keys=None):
         self._roles = roles or []
         self._groups = groups or []
         self._targets = targets or []
         self._users = users or []
         self._target_roles = target_roles or {}
         self._user_roles = user_roles or {}
+        # {user_id: [{"id": ..., "label": ..., "openssh_public_key": ...}]}
+        self._user_keys = user_keys or {}
         self.calls = []
 
     # listing
@@ -45,7 +56,10 @@ class FakeClient:
     # mutations (record + return a fake created object)
     def create_role(self, body):
         self.calls.append(("create_role", body))
-        return {"id": f"role-{body['name']}", **body}
+        created = {"id": f"role-{body['name']}", **body}
+        # Mirror the real server: created roles appear in later listings.
+        self._roles.append(created)
+        return created
 
     def update_role(self, role_id, body):
         self.calls.append(("update_role", role_id, body))
@@ -96,6 +110,19 @@ class FakeClient:
     def add_user_role(self, user_id, role_id):
         self.calls.append(("add_user_role", user_id, role_id))
 
+    def list_user_public_keys(self, user_id):
+        return list(self._user_keys.get(user_id, []))
+
+    def add_user_public_key(self, user_id, label, openssh_public_key):
+        self.calls.append(
+            ("add_user_public_key", user_id, label, openssh_public_key)
+        )
+        return {"id": f"key-{label}", "label": label,
+                "openssh_public_key": openssh_public_key}
+
+    def delete_user_public_key(self, user_id, key_id):
+        self.calls.append(("delete_user_public_key", user_id, key_id))
+
     def remove_user_role(self, user_id, role_id):
         self.calls.append(("remove_user_role", user_id, role_id))
 
@@ -142,7 +169,9 @@ class TestRoles:
                     "is_default": False}]
         )
         rec = Reconciler(client)
-        plan = rec.reconcile(roles=[Role("admin")], prune=True)
+        plan = rec.reconcile(
+            roles=[Role("admin")], prune=True, prune_config=PRUNE_ALL
+        )
         assert ("role", "stale") in _action_names(plan, Action.DELETE)
         assert ("delete_role", "2") in client.calls
 
@@ -297,7 +326,7 @@ class TestUsersWithRoles:
             users=[{"id": "u9", "username": "ghost", "description": ""}],
         )
         rec = Reconciler(client)
-        plan = rec.reconcile(users=[], prune=True)
+        plan = rec.reconcile(users=[], prune=True, prune_config=PRUNE_ALL)
         assert ("user", "ghost") in _action_names(plan, Action.DELETE)
         assert ("delete_user", "u9") in client.calls
 
@@ -309,3 +338,203 @@ class TestPlanFormatting:
         plan = rec.reconcile()
         assert plan.empty
         assert "already matches" in str(plan)
+
+
+class TestRoleCreationOrdering:
+    """A new role must be creatable AND assignable in a single pass."""
+
+    def test_apply_creates_role_then_assigns_to_existing_target(self):
+        client = FakeClient(
+            targets=[{"id": "t1", "name": "srv", "options": {},
+                      "description": ""}],
+        )
+        rec = Reconciler(client)
+        target = Target("srv", kind="ssh", host="h", auth="publickey",
+                        roles=["ssh-dev"])
+        rec.reconcile(roles=[Role("ssh-dev")], targets=[target])
+        assert ("create_role", {"name": "ssh-dev", "description": "",
+                                "is_default": False}) in client.calls
+        assert ("add_target_role", "t1", "role-ssh-dev") in client.calls
+
+    def test_apply_creates_role_then_assigns_to_new_user(self):
+        client = FakeClient()
+        rec = Reconciler(client)
+        user = User("alice", roles=["ssh-dev"])
+        rec.reconcile(roles=[Role("ssh-dev")], users=[user])
+        assert ("add_user_role", "user-alice", "role-ssh-dev") in client.calls
+
+    def test_dry_run_plans_assignment_of_uncreated_role(self):
+        client = FakeClient(
+            targets=[{"id": "t1", "name": "srv", "options": {},
+                      "description": ""}],
+        )
+        rec = Reconciler(client)
+        target = Target("srv", kind="ssh", host="h", auth="publickey",
+                        roles=["ssh-dev"])
+        plan = rec.reconcile(
+            roles=[Role("ssh-dev")], targets=[target], dry_run=True
+        )
+        details = [(c.name, c.detail) for c in plan.of(Action.UPDATE)]
+        assert ("srv", "+role ssh-dev") in details
+        # dry-run: nothing actually written
+        assert not any(c[0].startswith(("create_", "add_", "remove_"))
+                       for c in client.calls)
+
+
+KEY_A = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabc alice@laptop"
+KEY_B = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIdef alice@desktop"
+
+
+class TestUserPublicKeySync:
+    def test_new_user_gets_keys(self):
+        client = FakeClient()
+        rec = Reconciler(client)
+        rec.reconcile(users=[User("alice", public_keys=[KEY_A])])
+        assert ("add_user_public_key", "user-alice", "alice@laptop", KEY_A) \
+            in client.calls
+
+    def test_existing_user_missing_key_added(self):
+        client = FakeClient(
+            users=[{"id": "u1", "username": "alice", "description": ""}],
+            user_keys={"u1": [{"id": "k1", "label": "old",
+                               "openssh_public_key": KEY_A}]},
+        )
+        rec = Reconciler(client)
+        plan = rec.reconcile(
+            users=[User("alice", public_keys=[KEY_A, KEY_B])]
+        )
+        details = [(c.name, c.detail) for c in plan.of(Action.UPDATE)]
+        assert ("alice", "+key alice@desktop") in details
+        assert ("add_user_public_key", "u1", "alice@desktop", KEY_B) \
+            in client.calls
+        # KEY_A already present: not re-added
+        assert not any(c[:2] == ("add_user_public_key", "u1")
+                       and c[3] == KEY_A for c in client.calls)
+
+    def test_extraneous_key_removed(self):
+        client = FakeClient(
+            users=[{"id": "u1", "username": "alice", "description": ""}],
+            user_keys={"u1": [
+                {"id": "k1", "label": "keep", "openssh_public_key": KEY_A},
+                {"id": "k2", "label": "stale", "openssh_public_key": KEY_B},
+            ]},
+        )
+        rec = Reconciler(client)
+        plan = rec.reconcile(users=[User("alice", public_keys=[KEY_A])])
+        details = [(c.name, c.detail) for c in plan.of(Action.UPDATE)]
+        assert ("alice", "-key stale") in details
+        assert ("delete_user_public_key", "u1", "k2") in client.calls
+
+    def test_user_without_declared_keys_untouched(self):
+        client = FakeClient(
+            users=[{"id": "u1", "username": "alice", "description": ""}],
+            user_keys={"u1": [{"id": "k1", "label": "manual",
+                               "openssh_public_key": KEY_A}]},
+        )
+        rec = Reconciler(client)
+        plan = rec.reconcile(users=[User("alice")])
+        assert not any("key" in c.detail for c in plan.of(Action.UPDATE))
+        assert not any(c[0].startswith("delete_user_public_key")
+                       for c in client.calls)
+
+    def test_idempotent_when_keys_match(self):
+        client = FakeClient(
+            users=[{"id": "u1", "username": "alice", "description": ""}],
+            user_keys={"u1": [{"id": "k1", "label": "l",
+                               "openssh_public_key": KEY_A}]},
+        )
+        rec = Reconciler(client)
+        plan = rec.reconcile(users=[User("alice", public_keys=[KEY_A])])
+        assert plan.empty
+
+    def test_whitespace_normalisation_no_churn(self):
+        # Server stores the key with extra spacing: must still match.
+        client = FakeClient(
+            users=[{"id": "u1", "username": "alice", "description": ""}],
+            user_keys={"u1": [{"id": "k1", "label": "l",
+                               "openssh_public_key":
+                               "ssh-ed25519   AAAAC3NzaC1lZDI1NTE5AAAAIabc  alice@laptop"}]},
+        )
+        rec = Reconciler(client)
+        plan = rec.reconcile(users=[User("alice", public_keys=[KEY_A])])
+        assert plan.empty
+
+    def test_dry_run_plans_but_does_not_write(self):
+        client = FakeClient()
+        rec = Reconciler(client)
+        plan = rec.reconcile(
+            users=[User("alice", public_keys=[KEY_A])], dry_run=True
+        )
+        details = [(c.name, c.detail) for c in plan.of(Action.UPDATE)]
+        assert ("alice", "+key alice@laptop") in details
+        assert not any(c[0] == "add_user_public_key" for c in client.calls)
+
+    def test_key_without_comment_gets_blob_label(self):
+        bare = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabcdefghijkl"
+        client = FakeClient()
+        rec = Reconciler(client)
+        rec.reconcile(users=[User("alice", public_keys=[bare])])
+        add = next(c for c in client.calls if c[0] == "add_user_public_key")
+        assert add[2] == "...AAAAIabcdefghijkl"[-15:] or add[2].startswith("...")
+
+
+class TestPruneScope:
+    """Per-kind prune toggles and keep-lists (PruneConfig)."""
+
+    def _mixed_client(self):
+        return FakeClient(
+            roles=[{"id": "r9", "name": "stale-role", "description": "",
+                    "is_default": False}],
+            targets=[{"id": "t9", "name": "stale-target",
+                      "options": {}, "description": ""}],
+            users=[{"id": "u9", "username": "ghost", "description": ""}],
+        )
+
+    def test_default_prunes_targets_only(self):
+        """--prune with the default PruneConfig deletes targets, not users/roles."""
+        client = self._mixed_client()
+        rec = Reconciler(client)
+        plan = rec.reconcile(
+            roles=[], targets=[], users=[], prune=True,
+        )
+        deleted = _action_names(plan, Action.DELETE)
+        assert ("target", "stale-target") in deleted
+        assert ("user", "ghost") not in deleted
+        assert ("role", "stale-role") not in deleted
+
+    def test_enable_user_prune(self):
+        client = self._mixed_client()
+        rec = Reconciler(client)
+        pc = PruneConfig(prune_targets=True, prune_users=True)
+        plan = rec.reconcile(
+            roles=[], targets=[], users=[], prune=True, prune_config=pc,
+        )
+        deleted = _action_names(plan, Action.DELETE)
+        assert ("user", "ghost") in deleted
+        assert ("role", "stale-role") not in deleted  # roles still off
+
+    def test_keep_list_protects_user(self):
+        client = FakeClient(
+            users=[{"id": "u1", "username": "admin", "description": ""},
+                   {"id": "u2", "username": "ghost", "description": ""}],
+        )
+        rec = Reconciler(client)
+        pc = PruneConfig(prune_users=True, keep_users={"admin"})
+        plan = rec.reconcile(
+            users=[], prune=True, prune_config=pc,
+        )
+        deleted = _action_names(plan, Action.DELETE)
+        assert ("user", "ghost") in deleted
+        assert ("user", "admin") not in deleted
+        assert ("delete_user", "u1") not in client.calls
+        assert ("delete_user", "u2") in client.calls
+
+    def test_prune_false_ignores_config(self):
+        """No --prune master switch => nothing deleted regardless of scope."""
+        client = self._mixed_client()
+        rec = Reconciler(client)
+        pc = PruneConfig(prune_targets=True, prune_users=True, prune_roles=True)
+        plan = rec.reconcile(
+            roles=[], targets=[], users=[], prune=False, prune_config=pc,
+        )
+        assert plan.of(Action.DELETE) == []

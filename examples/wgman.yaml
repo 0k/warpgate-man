@@ -21,6 +21,17 @@ servers:
     url: https://wg-staging.example.com:8888
     api-key: ${WG_STAGING_TOKEN}
 
+# ── 1b. Optional: Odoo as source of desired state ────────────────────────────
+# When present, `warpgate-man fetch` lists SSH targets built from Odoo
+# maintenance.equipment records (those with the 'ssh_target' field set, format
+# [user@]DOMAIN_OR_IP[:PORT]), and diff/apply include them alongside the
+# targets defined in this file. CLI overrides: --odoo-url/--odoo-db/--odoo-user.
+#odoo:
+#  url: https://odoo.example.com
+#  db: mydb
+#  user: sync@example.com
+#  # password: ${ODOO_PASSWORD}   # omit to be prompted interactively
+
 # ── 2. Desired state: targets organised in groups ────────────────────────────
 # "folders / files" structure: groups contain targets. Maps onto Warpgate's
 # native target-groups (group_id). Access is granted through roles, not groups
@@ -82,3 +93,20 @@ users:
     roles: [developers]
   - name: carol
     roles: [analysts]
+
+# ── 5. Prune scope (optional) ────────────────────────────────────────────────
+# Controls what `apply --prune` (and `diff --prune`) is allowed to delete.
+# Without this section, --prune deletes TARGETS ONLY — the safe default when
+# the desired state comes from Odoo (which supplies targets, not users/roles).
+#
+# Each kind flag turns deletion on/off; keep-* lists protect individual names
+# even when that kind is pruned.
+#prune:
+#  targets: true                    # default true
+#  target-groups: false             # default false
+#  roles: false                     # default false
+#  users: false                     # default false
+#  keep-users: [admin]              # never delete these users, even if pruned
+#  keep-roles: [admin]
+#  keep-targets: []
+#  keep-target-groups: []

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from .client import WarpgateClient
 from .config import Config
-from .models import Role, ServerConfig, Target, TargetGroup, User
+from .models import PruneConfig, Role, ServerConfig, Target, TargetGroup, User
 from .reconcile import Plan, Reconciler
 
 
@@ -72,12 +72,15 @@ class WarpgateManager:
         targets: list[Target] | None = None,
         users: list[User] | None = None,
         prune: bool = False,
+        prune_config: PruneConfig | None = None,
         dry_run: bool = False,
     ) -> Plan:
         """Reconcile the given desired state onto the server.
 
         - ``prune=True`` deletes server-side entities absent from the desired
           state (off by default for safety).
+        - ``prune_config`` scopes which kinds are pruned and protects names
+          (defaults to targets-only via :meth:`PruneConfig.default`).
         - ``dry_run=True`` computes the plan without performing any writes.
         """
         reconciler = Reconciler(self.client)
@@ -87,6 +90,7 @@ class WarpgateManager:
             targets=targets,
             users=users,
             prune=prune,
+            prune_config=prune_config,
             dry_run=dry_run,
         )
 
@@ -98,6 +102,7 @@ class WarpgateManager:
         targets: list[Target] | None = None,
         users: list[User] | None = None,
         prune: bool = False,
+        prune_config: PruneConfig | None = None,
     ) -> Plan:
         """Compute the plan without applying it (``reconcile(dry_run=True)``)."""
         return self.reconcile(
@@ -106,6 +111,7 @@ class WarpgateManager:
             targets=targets,
             users=users,
             prune=prune,
+            prune_config=prune_config,
             dry_run=True,
         )
 
@@ -113,12 +119,17 @@ class WarpgateManager:
     def reconcile_config(
         self, config: Config, *, prune: bool = False, dry_run: bool = False
     ) -> Plan:
-        """Reconcile a full parsed :class:`Config` onto this server."""
+        """Reconcile a full parsed :class:`Config` onto this server.
+
+        The config's ``prune:`` section (if any) governs prune scope; when
+        absent, :meth:`PruneConfig.default` applies (targets only).
+        """
         return self.reconcile(
             roles=config.roles,
             target_groups=config.target_groups,
             targets=config.root_targets,
             users=config.users,
             prune=prune,
+            prune_config=config.prune,
             dry_run=dry_run,
         )

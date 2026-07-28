@@ -129,3 +129,61 @@ class TestLoadConfig:
         cfg = load_config(self._write(tmp_path, EXAMPLE))
         with pytest.raises(ConfigError, match="no server named 'ghost'"):
             cfg.server("ghost")
+
+
+class TestPruneSection:
+    def _write(self, tmp_path, content):
+        p = tmp_path / "wgman.yaml"
+        p.write_text(content)
+        return p
+
+    def test_absent_section(self, tmp_path):
+        cfg = load_config(self._write(
+            tmp_path, "servers:\n  - {name: p, url: u, api-key: k}\n"
+        ))
+        assert cfg.prune is None
+
+    def test_parsed(self, tmp_path):
+        cfg = load_config(self._write(tmp_path, textwrap.dedent(
+            """
+            servers:
+              - {name: p, url: u, api-key: k}
+            prune:
+              targets: true
+              users: false
+              keep-users: [admin, valentin]
+              keep-roles: [admin]
+            """
+        )))
+        assert cfg.prune is not None
+        assert cfg.prune.prune_targets is True
+        assert cfg.prune.prune_users is False
+        assert cfg.prune.keep_users == {"admin", "valentin"}
+        assert cfg.prune.keep_roles == {"admin"}
+
+    def test_defaults_within_section(self, tmp_path):
+        # An empty-ish prune section still yields targets-only defaults.
+        cfg = load_config(self._write(tmp_path, textwrap.dedent(
+            """
+            servers:
+              - {name: p, url: u, api-key: k}
+            prune:
+              keep-users: [admin]
+            """
+        )))
+        assert cfg.prune.prune_targets is True
+        assert cfg.prune.prune_users is False
+        assert cfg.prune.prune_roles is False
+        assert cfg.prune.prune_target_groups is False
+        assert cfg.prune.keep_users == {"admin"}
+
+    def test_unknown_key_raises(self, tmp_path):
+        with pytest.raises(ConfigError, match="unknown key 'targts'"):
+            load_config(self._write(tmp_path, textwrap.dedent(
+                """
+                servers:
+                  - {name: p, url: u, api-key: k}
+                prune:
+                  targts: true
+                """
+            )))

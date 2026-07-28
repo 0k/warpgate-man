@@ -23,7 +23,8 @@ from typing import Any
 import yaml
 
 from .exceptions import ConfigError, InterpolationError
-from .models import Role, ServerConfig, Target, TargetGroup, User
+from .models import PruneConfig, Role, ServerConfig, Target, TargetGroup, User
+from .odoo import OdooConfig
 
 # Default locations searched when --config is not given, in order.
 DEFAULT_CONFIG_PATHS = (
@@ -37,15 +38,19 @@ DEFAULT_CONFIG_PATHS = (
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-def interpolate(value: str) -> str:
+def interpolate(value: str, *, strict: bool = True) -> str:
     """Replace every ``${VAR}`` in *value* with ``os.environ['VAR']``.
 
-    Raises :class:`InterpolationError` if a referenced variable is unset.
+    Raises :class:`InterpolationError` if a referenced variable is unset,
+    unless *strict* is False, in which case the ``${VAR}`` literal is kept
+    (useful for commands that only use part of the config).
     """
 
     def repl(match: re.Match[str]) -> str:
         name = match.group(1)
         if name not in os.environ:
+            if not strict:
+                return match.group(0)
             raise InterpolationError(
                 f"environment variable {name!r} referenced in config is not set"
             )
@@ -54,14 +59,14 @@ def interpolate(value: str) -> str:
     return _ENV_RE.sub(repl, value)
 
 
-def _interpolate_tree(node: Any) -> Any:
+def _interpolate_tree(node: Any, *, strict: bool = True) -> Any:
     """Recursively interpolate ``${ENV}`` in all string leaves of *node*."""
     if isinstance(node, str):
-        return interpolate(node)
+        return interpolate(node, strict=strict)
     if isinstance(node, dict):
-        return {k: _interpolate_tree(v) for k, v in node.items()}
+        return {k: _interpolate_tree(v, strict=strict) for k, v in node.items()}
     if isinstance(node, list):
-        return [_interpolate_tree(v) for v in node]
+        return [_interpolate_tree(v, strict=strict) for v in node]
     return node
 
 
@@ -74,6 +79,8 @@ class Config:
     root_targets: list[Target] = field(default_factory=list)
     roles: list[Role] = field(default_factory=list)
     users: list[User] = field(default_factory=list)
+    odoo: OdooConfig | None = None
+    prune: PruneConfig | None = None
 
     # -- convenience accessors -------------------------------------------- #
     def server(self, name: str) -> ServerConfig:
@@ -88,6 +95,44 @@ class Config:
         for group in self.target_groups:
             targets.extend(group.targets)
         return targets
+
+    def merge_targets(self, targets: list[Target]) -> None:
+        """Add externally-sourced targets (e.g. from Odoo) as root targets.
+
+        Raises :class:`ConfigError` on name collision with existing targets.
+        """
+        existing = {t.name for t in self.all_targets()}
+        for target in targets:
+            if target.name in existing:
+                raise ConfigError(
+                    f"odoo target {target.name!r} collides with a target "
+                    "already defined in the config file"
+                )
+            existing.add(target.name)
+            self.root_targets.append(target)
+
+    def merge_users(self, users: list[User]) -> None:
+        """Add externally-sourced users (e.g. from Odoo).
+
+        Raises :class:`ConfigError` on name collision with existing users.
+        """
+        existing = {u.name for u in self.users}
+        for user in users:
+            if user.name in existing:
+                raise ConfigError(
+                    f"odoo user {user.name!r} collides with a user "
+                    "already defined in the config file"
+                )
+            existing.add(user.name)
+            self.users.append(user)
+
+    def merge_roles(self, roles: list[Role]) -> None:
+        """Add externally-sourced roles, skipping already-defined names."""
+        existing = {r.name for r in self.roles}
+        for role in roles:
+            if role.name not in existing:
+                existing.add(role.name)
+                self.roles.append(role)
 
     # -- parsing ----------------------------------------------------------- #
     @classmethod
@@ -110,6 +155,12 @@ class Config:
         ]
         roles = [Role.from_dict(r) for r in data.get("roles", [])]
         users = [User.from_dict(u) for u in data.get("users", [])]
+        odoo = (
+            OdooConfig.from_dict(data["odoo"]) if data.get("odoo") else None
+        )
+        prune = (
+            PruneConfig.from_dict(data["prune"]) if data.get("prune") else None
+        )
 
         config = cls(
             servers=servers,
@@ -117,6 +168,8 @@ class Config:
             root_targets=root_targets,
             roles=roles,
             users=users,
+            odoo=odoo,
+            prune=prune,
         )
         config.validate()
         return config
@@ -153,10 +206,14 @@ def _validate_unique(names: list[Any], kind: str) -> None:
         seen.add(name)
 
 
-def load_config(path: str | Path | None = None) -> Config:
+def load_config(
+    path: str | Path | None = None, *, strict_env: bool = True
+) -> Config:
     """Load and validate the configuration from *path*.
 
     If *path* is ``None``, the default locations are searched in order.
+    With ``strict_env=False``, unset ``${ENV}`` references are kept verbatim
+    instead of raising (for commands that only use part of the config).
     """
     resolved = _resolve_path(path)
     try:
@@ -172,7 +229,7 @@ def load_config(path: str | Path | None = None) -> Config:
     if data is None:
         raise ConfigError(f"config file {resolved} is empty")
 
-    data = _interpolate_tree(data)
+    data = _interpolate_tree(data, strict=strict_env)
     return Config.from_dict(data)
 
 

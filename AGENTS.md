@@ -12,9 +12,13 @@ one or more Warpgate servers via their HTTP admin API.
   - `client.py` — synchronous httpx client for `/@warpgate/admin/api`
   - `reconcile.py` — diff + apply logic (create / update / prune)
   - `manager.py` — `WarpgateManager`, the high-level public API
+  - `odoo.py` — Odoo as desired-state source (SSH targets from
+    `maintenance.equipment.ssh_target`, via the `oerpc` lib)
   - `exceptions.py` — `WgmanError` hierarchy
-  - `cli.py` — argparse CLI (`diff`, `apply`, `--prune`, `--server`, `--config`)
-- `tests/` — pytest suite (uses `respx` to mock the HTTP API)
+  - `cli.py` — argparse CLI (`fetch`, `diff`, `apply`, `--prune`, `--server`,
+    `--config`, `--odoo-url`/`--odoo-db`/`--odoo-user`)
+- `tests/` — pytest suite (uses `respx` to mock the HTTP API; the Odoo
+  source is tested with an injected fetcher, no oerpc mocking)
 - `examples/wgman.yaml` — annotated example config
 
 ## Key facts about Warpgate (verified against a live warpgate 0.25.4 server)
@@ -59,9 +63,48 @@ to these at the API boundary:
   scripts.
 - `apply` does create + update only; deletions require `--prune` / `prune=True`.
 
+## Prune scope (`PruneConfig`)
+
+- `--prune` is the master switch; *what* it deletes is governed by the
+  optional `prune:` config section (parsed into `Config.prune`,
+  `models.PruneConfig`).
+- **Default (no `prune:` section): targets only.** `PruneConfig.default()`
+  prunes targets and leaves target-groups / roles / users untouched — the
+  safe choice for the Odoo workflow (Odoo sources targets, not users/roles;
+  a naive full prune would wipe the admin user).
+- Per-kind flags (`targets`/`target-groups`/`roles`/`users`, dash-cased in
+  YAML) toggle deletion per kind; `keep-<kind>` lists protect individual
+  names even when that kind is pruned (e.g. `keep-users: [admin]`).
+- Reconciler mechanics: `reconcile()` takes `prune` (bool master switch) +
+  `prune_config`; each `_reconcile_*` receives `prune and pc.prune_<kind>`
+  plus the matching keep-set. `reconcile_config()` passes `config.prune`
+  through (None → targets-only default).
+
+## Odoo source (`odoo.py`)
+
+- Desired state can come from an Odoo server instead of inline YAML: the
+  config's `odoo:` section (`url`, `db`, `user`, optional `password`) or the
+  CLI overrides `--odoo-url` / `--odoo-db` / `--odoo-user`.
+- Mapping: `maintenance.equipment` records (Elabore `maintenance_server_data`
+  module) with `ssh_target` set become SSH targets. `ssh_target` format:
+  `[user@]DOMAIN_OR_IP[:PORT]` (defaults `root` / 22); the target label is the
+  equipment `name`; auth is `publickey`. SSH targets only for now — no
+  users/roles/groups from Odoo.
+- Password: config value (with `${ENV}`) or interactive `getpass` prompt on a
+  TTY; no CLI flag on purpose (would leak into `ps` / shell history).
+- `fetch` prints the Odoo-sourced targets as a YAML `targets:` listing that
+  round-trips as config; `diff`/`apply` merge them into `Config.root_targets`
+  (name collisions with file targets are errors).
+- `fetch` loads the config with `strict_env=False`: unset `${ENV}` refs used
+  by other sections (e.g. the Warpgate `api-key`) don't block it; a kept
+  `${...}` literal in the Odoo password is treated as unset.
+- Transport is `oerpc` (JSON-RPC), a local project at `../oerpc`, wired as
+  the `odoo` extra via `[tool.uv.sources]` until published. Tests inject a
+  fake fetcher instead of mocking oerpc.
+
 ## Dev
 
 ```sh
-uv sync --extra dev      # or: uv pip install -e '.[dev]'
+uv sync --extra dev --extra odoo      # odoo extra needs ../oerpc checkout
 uv run pytest
 ```

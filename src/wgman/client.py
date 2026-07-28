@@ -149,3 +149,23 @@ class WarpgateClient:
 
     def remove_user_role(self, user_id: str, role_id: str) -> None:
         self._request("DELETE", f"users/{user_id}/roles/{role_id}")
+
+    # -- user public-key credentials ---------------------------------------- #
+    def list_user_public_keys(self, user_id: str) -> list[dict[str, Any]]:
+        return self._request(
+            "GET", f"users/{user_id}/credentials/public-keys"
+        ) or []
+
+    def add_user_public_key(
+        self, user_id: str, label: str, openssh_public_key: str
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"users/{user_id}/credentials/public-keys",
+            json={"label": label, "openssh_public_key": openssh_public_key},
+        )
+
+    def delete_user_public_key(self, user_id: str, key_id: str) -> None:
+        self._request(
+            "DELETE", f"users/{user_id}/credentials/public-keys/{key_id}"
+        )

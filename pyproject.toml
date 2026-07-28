@@ -14,10 +14,17 @@ dependencies = [
 warpgate-man = "wgman.cli:main"
 
 [project.optional-dependencies]
+odoo = [
+    "oerpc",
+]
 dev = [
     "pytest>=8.0",
     "respx>=0.21",
 ]
+
+[tool.uv.sources]
+## Local checkout until oerpc is published (github.com/0k/oerpc planned).
+oerpc = { path = "../oerpc", editable = true }
 
 [build-system]
 requires = ["setuptools>=68"]

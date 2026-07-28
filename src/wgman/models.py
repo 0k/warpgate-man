@@ -95,11 +95,19 @@ class Role:
 # --------------------------------------------------------------------------- #
 @dataclass
 class User:
-    """A Warpgate user. ``roles`` are role names granting target access."""
+    """A Warpgate user.
+
+    ``roles`` are role names granting target access. ``public_keys`` is an
+    optional list of OpenSSH public keys (``ssh-ed25519 AAAA... comment``);
+    when non-empty, wgman strictly synchronises the user's public-key
+    credentials to this list (add missing, remove extraneous). Empty means
+    keys are not managed for this user.
+    """
 
     name: str
     description: str = ""
     roles: list[str] = field(default_factory=list)
+    public_keys: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], where: str = "user") -> "User":
@@ -108,6 +116,7 @@ class User:
             name=name,
             description=data.get("description", ""),
             roles=list(data.get("roles", [])),
+            public_keys=list(data.get("public-keys", [])),
         )
 
     def to_api_body(self) -> "dict[str, Any]":
@@ -226,6 +235,34 @@ class Target:
             external_host=data.get("external-host", data.get("external_host")),
         )
 
+    def to_config_dict(self) -> "dict[str, Any]":
+        """This target as a YAML-config-style mapping (dash-cased keys).
+
+        Round-trips with :meth:`from_dict`: the output is valid under the
+        ``targets:`` key of a wgman config file.
+        """
+        data: dict[str, Any] = {"name": self.name, "kind": self.kind}
+        if self.description:
+            data["description"] = self.description
+        if self.kind == "http":
+            data["url"] = self.url
+            if self.external_host:
+                data["external-host"] = self.external_host
+        else:
+            data["host"] = self.host
+            if self.port is not None:
+                data["port"] = self.port
+            if self.username is not None:
+                data["username"] = self.username
+            if self.auth is not None:
+                auth = dict(self.auth)
+                data["auth"] = (
+                    auth["kind"] if list(auth) == ["kind"] else auth
+                )
+        if self.roles:
+            data["roles"] = list(self.roles)
+        return data
+
     def options(self) -> "dict[str, Any]":
         """The Warpgate ``options`` block, in admin-API wire format.
 
@@ -312,6 +349,72 @@ class TargetGroup:
         if self.color is not None:
             body["color"] = _COLOR_WIRE[self.color]
         return body
+
+
+# --------------------------------------------------------------------------- #
+# PruneConfig
+# --------------------------------------------------------------------------- #
+# Resource kinds that prune can act on (YAML/attribute names).
+PRUNE_KINDS = ("targets", "target-groups", "roles", "users")
+
+
+@dataclass
+class PruneConfig:
+    """Scopes which resource kinds ``--prune`` deletes, and protects names.
+
+    Each ``prune_<kind>`` flag turns deletion on/off for that kind. The
+    ``keep_<kind>`` sets list names that are never deleted even when that
+    kind is pruned (e.g. always keep the ``admin`` user).
+
+    The default (:meth:`default`) prunes targets only — the safe choice
+    when the desired state is sourced from Odoo, which supplies targets but
+    no users/roles/groups.
+    """
+
+    prune_targets: bool = True
+    prune_target_groups: bool = False
+    prune_roles: bool = False
+    prune_users: bool = False
+
+    keep_targets: set[str] = field(default_factory=set)
+    keep_target_groups: set[str] = field(default_factory=set)
+    keep_roles: set[str] = field(default_factory=set)
+    keep_users: set[str] = field(default_factory=set)
+
+    @classmethod
+    def default(cls) -> "PruneConfig":
+        """The default prune scope: targets only."""
+        return cls()
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], where: str = "prune") -> "PruneConfig":
+        if not isinstance(data, dict):
+            raise ConfigError(f"{where}: must be a mapping")
+
+        known = set(PRUNE_KINDS) | {f"keep-{k}" for k in PRUNE_KINDS}
+        for key in data:
+            if key not in known:
+                raise ConfigError(
+                    f"{where}: unknown key {key!r} "
+                    f"(expected one of {', '.join(sorted(known))})"
+                )
+
+        def flag(kind: str, default: bool) -> bool:
+            return bool(data.get(kind, default))
+
+        def keep(kind: str) -> set[str]:
+            return set(data.get(f"keep-{kind}", []))
+
+        return cls(
+            prune_targets=flag("targets", True),
+            prune_target_groups=flag("target-groups", False),
+            prune_roles=flag("roles", False),
+            prune_users=flag("users", False),
+            keep_targets=keep("targets"),
+            keep_target_groups=keep("target-groups"),
+            keep_roles=keep("roles"),
+            keep_users=keep("users"),
+        )
 
 
 # --------------------------------------------------------------------------- #

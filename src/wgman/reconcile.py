@@ -24,7 +24,7 @@ from enum import Enum
 from typing import Any
 
 from .client import WarpgateClient
-from .models import Role, Target, TargetGroup, User
+from .models import PruneConfig, Role, Target, TargetGroup, User
 
 
 class Action(str, Enum):
@@ -92,6 +92,7 @@ class Reconciler:
         targets: list[Target] | None = None,
         users: list[User] | None = None,
         prune: bool = False,
+        prune_config: PruneConfig | None = None,
         dry_run: bool = False,
     ) -> Plan:
         """Reconcile the given desired state onto the server.
@@ -99,11 +100,17 @@ class Reconciler:
         Only the resource kinds explicitly provided (non-``None``) are
         reconciled. Passing ``None`` for a kind leaves it untouched (and never
         prunes it), which lets callers manage a subset.
+
+        When ``prune`` is true, *which* kinds are pruned and which names are
+        protected is governed by ``prune_config`` (defaults to
+        :meth:`PruneConfig.default`, i.e. targets only).
         """
         roles = roles or []
         target_groups = target_groups or []
         targets = list(targets or [])
         users = users or []
+
+        pc = prune_config or PruneConfig.default()
 
         # Targets nested in groups are part of the managed target set.
         for group in target_groups:
@@ -111,22 +118,51 @@ class Reconciler:
 
         plan = Plan()
 
-        if roles is not None:
-            self._reconcile_roles(roles, plan, prune, dry_run)
-        if target_groups is not None:
-            self._reconcile_groups(target_groups, plan, prune, dry_run)
-        if targets is not None:
-            self._reconcile_targets(targets, plan, prune, dry_run)
-        if users is not None:
-            self._reconcile_users(users, plan, prune, dry_run)
+        # Role names that will exist after the roles pass: used so that
+        # dry-run plans role assignments for roles not yet created (in a
+        # real apply the roles ARE created before targets/users are synced).
+        planned_roles = {r.name for r in roles}
+
+        self._reconcile_roles(
+            roles, plan, prune and pc.prune_roles, pc.keep_roles, dry_run
+        )
+        self._reconcile_groups(
+            target_groups, plan,
+            prune and pc.prune_target_groups, pc.keep_target_groups, dry_run,
+        )
+        self._reconcile_targets(
+            targets, plan, prune and pc.prune_targets, pc.keep_targets,
+            dry_run, planned_roles,
+        )
+        self._reconcile_users(
+            users, plan, prune and pc.prune_users, pc.keep_users,
+            dry_run, planned_roles,
+        )
 
         return plan
+
+    def _role_ids_with_planned(
+        self, planned_roles: set[str] | None, dry_run: bool
+    ) -> dict[str, dict[str, Any]]:
+        """Live roles by name, extended with planned-but-uncreated roles.
+
+        Called after the roles pass: in a real apply the planned roles now
+        exist server-side, so the fresh read covers them. In dry-run they
+        were not created; synthesize placeholder entries so role-assignment
+        planning still reports the (+role ...) actions an apply would do.
+        """
+        role_ids = _by_name(self.client.list_roles())
+        if dry_run:
+            for name in planned_roles or set():
+                role_ids.setdefault(name, {"id": None, "name": name})
+        return role_ids
 
     # ------------------------------------------------------------------ #
     # Roles
     # ------------------------------------------------------------------ #
     def _reconcile_roles(
-        self, desired: list[Role], plan: Plan, prune: bool, dry_run: bool
+        self, desired: list[Role], plan: Plan, prune: bool,
+        keep: set[str], dry_run: bool,
     ) -> None:
         live = _by_name(self.client.list_roles())
         for role in desired:
@@ -143,16 +179,18 @@ class Reconciler:
         if prune:
             desired_names = {r.name for r in desired}
             for name, obj in live.items():
-                if name not in desired_names:
-                    plan.add(Action.DELETE, "role", name)
-                    if not dry_run:
-                        self.client.delete_role(obj["id"])
+                if name in desired_names or name in keep:
+                    continue
+                plan.add(Action.DELETE, "role", name)
+                if not dry_run:
+                    self.client.delete_role(obj["id"])
 
     # ------------------------------------------------------------------ #
     # Target groups
     # ------------------------------------------------------------------ #
     def _reconcile_groups(
-        self, desired: list[TargetGroup], plan: Plan, prune: bool, dry_run: bool
+        self, desired: list[TargetGroup], plan: Plan, prune: bool,
+        keep: set[str], dry_run: bool,
     ) -> None:
         live = _by_name(self.client.list_target_groups())
         for group in desired:
@@ -169,19 +207,25 @@ class Reconciler:
         if prune:
             desired_names = {g.name for g in desired}
             for name, obj in live.items():
-                if name not in desired_names:
-                    plan.add(Action.DELETE, "target-group", name)
-                    if not dry_run:
-                        self.client.delete_target_group(obj["id"])
+                if name in desired_names or name in keep:
+                    continue
+                plan.add(Action.DELETE, "target-group", name)
+                if not dry_run:
+                    self.client.delete_target_group(obj["id"])
 
     # ------------------------------------------------------------------ #
     # Targets (+ role assignments)
     # ------------------------------------------------------------------ #
     def _reconcile_targets(
-        self, desired: list[Target], plan: Plan, prune: bool, dry_run: bool
+        self, desired: list[Target], plan: Plan, prune: bool,
+        keep: set[str], dry_run: bool, planned_roles: set[str] | None = None,
     ) -> None:
+        # Re-read roles AFTER the roles pass so freshly-created roles are
+        # assignable in the same run. In dry-run they were not actually
+        # created: synthesize entries for planned roles so the plan still
+        # shows the (+role ...) assignments a real apply would perform.
         live = _by_name(self.client.list_targets())
-        role_ids = _by_name(self.client.list_roles())
+        role_ids = self._role_ids_with_planned(planned_roles, dry_run)
         group_ids = _by_name(self.client.list_target_groups())
 
         for target in desired:
@@ -212,10 +256,11 @@ class Reconciler:
         if prune:
             desired_names = {t.name for t in desired}
             for name, obj in live.items():
-                if name not in desired_names:
-                    plan.add(Action.DELETE, "target", name)
-                    if not dry_run:
-                        self.client.delete_target(obj["id"])
+                if name in desired_names or name in keep:
+                    continue
+                plan.add(Action.DELETE, "target", name)
+                if not dry_run:
+                    self.client.delete_target(obj["id"])
 
     def _sync_target_roles(
         self,
@@ -251,10 +296,11 @@ class Reconciler:
     # Users (+ role assignments)
     # ------------------------------------------------------------------ #
     def _reconcile_users(
-        self, desired: list[User], plan: Plan, prune: bool, dry_run: bool
+        self, desired: list[User], plan: Plan, prune: bool,
+        keep: set[str], dry_run: bool, planned_roles: set[str] | None = None,
     ) -> None:
         live = _by_name(self.client.list_users(), key="username")
-        role_ids = _by_name(self.client.list_roles())
+        role_ids = self._role_ids_with_planned(planned_roles, dry_run)
 
         for user in desired:
             body = user.to_api_body()
@@ -266,6 +312,13 @@ class Reconciler:
                         created["id"], user, role_ids, plan, dry_run,
                         creating=True,
                     )
+                    self._sync_user_keys(
+                        created["id"], user, plan, dry_run, creating=True
+                    )
+                else:
+                    self._sync_user_keys(
+                        None, user, plan, dry_run, creating=True
+                    )
             else:
                 obj = live[user.name]
                 if _user_differs(user, obj):
@@ -275,14 +328,18 @@ class Reconciler:
                 self._sync_user_roles(
                     obj["id"], user, role_ids, plan, dry_run, creating=False
                 )
+                self._sync_user_keys(
+                    obj["id"], user, plan, dry_run, creating=False
+                )
 
         if prune:
             desired_names = {u.name for u in desired}
             for name, obj in live.items():
-                if name not in desired_names:
-                    plan.add(Action.DELETE, "user", name)
-                    if not dry_run:
-                        self.client.delete_user(obj["id"])
+                if name in desired_names or name in keep:
+                    continue
+                plan.add(Action.DELETE, "user", name)
+                if not dry_run:
+                    self.client.delete_user(obj["id"])
 
     def _sync_user_roles(
         self,
@@ -319,6 +376,67 @@ class Reconciler:
             plan.add(Action.UPDATE, "user", user.name, f"-role {role}")
             if not dry_run:
                 self.client.remove_user_role(user_id, role_ids[role]["id"])
+
+    def _sync_user_keys(
+        self,
+        user_id: str | None,
+        user: User,
+        plan: Plan,
+        dry_run: bool,
+        *,
+        creating: bool,
+    ) -> None:
+        """Strictly sync the user's public-key credentials to the desired set.
+
+        Only acts when the desired user declares public keys (non-empty
+        ``public_keys``); users without declared keys are left untouched so
+        manually-managed credentials survive. For managed users the sync is
+        strict: keys absent from the desired set are REMOVED (a key revoked
+        in the source must disappear from the bastion).
+
+        ``user_id`` is ``None`` only in dry-run creating mode (the user does
+        not exist server-side yet): additions are planned, nothing is read.
+        """
+        desired = list(user.public_keys)
+        if not desired:
+            return
+
+        current: dict[str, dict[str, Any]] = {}
+        if not creating and user_id is not None:
+            current = {
+                # Normalise whitespace for comparison; server stores the
+                # openssh key verbatim.
+                " ".join(k["openssh_public_key"].split()): k
+                for k in self.client.list_user_public_keys(user_id)
+            }
+
+        desired_set = set(desired)
+        for key in desired:
+            if key in current:
+                continue
+            label = _key_label(key)
+            plan.add(Action.UPDATE, "user", user.name, f"+key {label}")
+            if not dry_run and user_id is not None:
+                self.client.add_user_public_key(user_id, label, key)
+        for key, obj in current.items():
+            if key in desired_set:
+                continue
+            plan.add(
+                Action.UPDATE, "user", user.name,
+                f"-key {obj.get('label') or _key_label(key)}",
+            )
+            if not dry_run and user_id is not None:
+                self.client.delete_user_public_key(user_id, obj["id"])
+
+
+def _key_label(openssh_key: str) -> str:
+    """A human label for one OpenSSH key: its comment, else a fingerprint-ish
+    tail of the base64 blob."""
+    parts = openssh_key.split(None, 2)
+    if len(parts) >= 3 and parts[2].strip():
+        return parts[2].strip()
+    blob = parts[1] if len(parts) >= 2 else openssh_key
+    return f"...{blob[-12:]}"
 
 
 # --------------------------------------------------------------------------- #
