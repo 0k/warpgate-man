@@ -7,14 +7,28 @@
 #   warpgate-man --config wgman.yaml apply          # create / update
 #   warpgate-man --config wgman.yaml apply --prune  # + delete what is not here
 #
+# The same file also serves the end-user command, which only reads:
+#
+#   warpgate-man --config wgman.yaml ssh-config     # ssh stanzas for MY targets
+#
 # Secrets must be referenced through environment variables: ${VAR}. They are
 # interpolated at load time; never write secrets in clear text in this file.
 
-# ── 1. Warpgate servers to manage ────────────────────────────────────────────
+# ── 1. Warpgate servers ──────────────────────────────────────────────────────
+# 'api-key' is YOUR Warpgate token (sent as X-Warpgate-Token). What you may
+# run follows from what that token is:
+#   - a personal API token (web UI -> profile -> API tokens) suffices for
+#     'ssh-config', which lists the targets your roles grant you;
+#   - 'diff' / 'apply' additionally require admin rights.
+# The server's global admin token (--enable-admin-token) is bound to no user,
+# so it administers fine but 'ssh-config' refuses it.
+#
+# An end user needs nothing but this section: everything below describes
+# desired state and is used by diff/apply only.
 servers:
   - name: prod                      # logical id, used by --server prod
     url: https://warpgate.example.com:8888
-    api-key: ${WG_PROD_TOKEN}       # Warpgate admin token (X-Warpgate-Token)
+    api-key: ${WG_PROD_TOKEN}
     verify-tls: true                # optional, default true
 
   - name: staging

@@ -9,14 +9,18 @@ one or more Warpgate servers via their HTTP admin API.
 - `src/wgman/` — the library (package `wgman`)
   - `models.py` — dataclasses + JSON mapping to/from the Warpgate admin API
   - `config.py` — YAML parsing, validation, `${ENV}` interpolation
-  - `client.py` — synchronous httpx client for `/@warpgate/admin/api`
+  - `client.py` — synchronous httpx clients: `_Transport` (shared connection
+    + error translation), `WarpgateClient` (`/@warpgate/admin/api`),
+    `WarpgateUserClient` (`/@warpgate/api`)
   - `reconcile.py` — diff + apply logic (create / update / prune)
   - `manager.py` — `WarpgateManager`, the high-level public API
+  - `sshconfig.py` — pure renderer: user-API payloads → `ssh_config(5)`
   - `odoo.py` — Odoo as desired-state source (SSH targets from
     `maintenance.equipment.ssh_target`, via the `oerpc` lib)
   - `exceptions.py` — `WgmanError` hierarchy
-  - `cli.py` — argparse CLI (`fetch`, `diff`, `apply`, `--prune`, `--server`,
-    `--config`, `--odoo-url`/`--odoo-db`/`--odoo-user`)
+  - `cli.py` — argparse CLI (`fetch`, `diff`, `apply`, `ssh-config`,
+    `--prune`, `--server`, `--config`,
+    `--odoo-url`/`--odoo-db`/`--odoo-user`)
 - `tests/` — pytest suite (uses `respx` to mock the HTTP API; the Odoo
   source is tested with an injected fetcher, no oerpc mocking)
 - `examples/wgman.yaml` — annotated example config
@@ -55,10 +59,52 @@ to these at the API boundary:
   must treat default roles as implicit and never try to remove them, or it
   never converges.
 
+## User API + `ssh-config` (verified against warpgate @ bb88fff)
+
+Warpgate has a SECOND API at `/@warpgate/api` (no `admin/`), for what one
+authenticated *user* may see. Same `X-Warpgate-Token` header — the middleware
+tries the global admin token first, then the per-user `api_tokens` table.
+`ssh-config` is built on it; admins are users too, so there is one code path.
+
+- `GET /targets` is **already filtered server-side** by role intersection.
+  Do NOT re-implement access logic. It returns
+  `{id, name, description, kind, external_host, group, default_database_name}`
+  and deliberately NOT the backend `host`/`port`/`username`.
+- A per-user token whose user holds an admin role is filtered like any other
+  user's — there is no admin-role bypass in that handler.
+- The **global** admin token (`--enable-admin-token`) is bound to no user:
+  upstream has an explicit `RequestAuthorization::AdminToken => targets.clear()`
+  branch, and `/info` returns `username: null`. So it yields an EMPTY list, not
+  the whole fleet. `BastionInfo.from_info` refuses it on the null username
+  rather than emitting a silently empty config.
+- `GET /info` gives `username`, `external_hosts.<proto>`, `ports.<proto>`.
+  Always take the SSH host/port from there: it honours reverse-proxy / NAT
+  config, unlike the 2222 default.
+- SSH addressing: the client only ever reaches the BASTION, and the target is
+  selected through the username, `<user>:<target>` (`:` is what Warpgate's own
+  UI generates; `#` also parses). The backend account must never be emitted —
+  Warpgate dials the backend itself. `known_hosts` pins the bastion, so never
+  emit `StrictHostKeyChecking no`.
+- **ssh_config(5) quoting**: target names may contain spaces; an unquoted
+  `User a:b c` is rejected with "extra arguments at end of line" and that
+  invalidates the WHOLE file, not just the stanza. `selector_for()` quotes
+  such values. `tests/test_sshconfig.py` verifies this with the real `ssh -G`
+  binary — string assertions alone cannot catch it.
+- SSO cannot be driven headlessly (browser-redirect only; PKCE verifier lives
+  server-side, device-code endpoint unset). SSO users mint a personal API
+  token in the web UI. Do not promise CLI SSO.
+
 ## Conventions
 
 - YAML config keys are **dash-cased** (`target-groups`, `api-key`,
   `external-host`), per the user's global rules.
+- `api-key` is *the caller's* token, not necessarily an admin one: the persona
+  lives in the token, not in the config schema. Hence one `servers:` section
+  for both admin and end-user commands.
+- API errors are translated at the client boundary into the `ApiError`
+  subclasses (`AuthenticationError` 401, `AuthorizationError` 403,
+  `UnsupportedApiError` 404-on-user-API) with messages stating cause and
+  remedy; the raw status/body stay on the exception.
 - Synchronous API (httpx sync) — designed to be callable from Odoo / plain
   scripts.
 - `apply` does create + update only; deletions require `--prune` / `prune=True`.

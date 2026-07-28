@@ -60,13 +60,28 @@ users:
 Secrets are referenced through environment variables (=${VAR}=) and
 interpolated at load time. Never write secrets in clear text.
 
-* Getting an admin token
+* Tokens
 
-Start Warpgate with =--enable-admin-token= and set the =WARPGATE_ADMIN_TOKEN=
-environment variable on the server. That value is the =api-key= used by
-=warpgate-man=.
+=api-key= is *your* Warpgate token, and what you may run follows from what
+that token is:
+
+- A *personal API token* (Warpgate web UI → your profile → API tokens)
+  identifies you as a user. It is what =ssh-config= needs.
+- An *admin token* is additionally allowed on the admin API, so =diff= and
+  =apply= need one. Start Warpgate with =--enable-admin-token= and set
+  =WARPGATE_ADMIN_TOKEN= on the server, or give an admin user a personal
+  token.
+
+Using a personal token with =apply= fails with a clear message rather than a
+bare HTTP 403.
+
+Note the server's *global* admin token (=--enable-admin-token=) is a machine
+credential bound to no user: Warpgate reports no username for it and grants
+it no target, so =ssh-config= refuses it.
 
 * CLI usage
+
+** Administering a server
 
 #+begin_src sh
 # Show the delta between the YAML and the live server (no writes)
@@ -81,6 +96,52 @@ warpgate-man --config wgman.yaml apply --prune
 # Target a single server from a multi-server config
 warpgate-man --config wgman.yaml --server prod apply
 #+end_src
+
+** Connecting to your targets
+
+=ssh-config= asks Warpgate which targets your token can reach and prints
+matching =ssh_config(5)= stanzas. It only reads, and needs no admin rights —
+admins are users too, and get their own reachable targets like anyone else.
+
+#+begin_src sh
+warpgate-man --config wgman.yaml ssh-config
+#+end_src
+
+#+begin_src conf
+Host web-01
+    HostName ssh.warpgate.example.com
+    Port     2222
+    User     alice:web-01
+#+end_src
+
+Then =ssh web-01= just works. The usual pattern is a dedicated file included
+from your ssh config:
+
+#+begin_src sh
+warpgate-man --config wgman.yaml ssh-config -o ~/.ssh/config.d/warpgate
+# and once, in ~/.ssh/config:  Include config.d/warpgate
+#+end_src
+
+Use =--prefix= to keep Warpgate aliases apart from your own hosts (=--prefix
+wg-= gives =ssh wg-web-01=). When several servers are queried, aliases are
+prefixed with the server name automatically, since target names are only
+unique within one server.
+
+What the stanzas mean: the SSH client connects to the *bastion*, and the
+target is selected through the username, encoded =<user>:<target>=. The
+backend's own account never appears — Warpgate dials it with its stored
+credentials. Likewise =known_hosts= pins the bastion, not each backend, so
+nothing here weakens host-key checking.
+
+Only SSH targets are emitted; HTTP, MySQL, Postgres and Kubernetes targets
+are not reachable through an ssh client.
+
+*** Authenticating with SSO
+
+Warpgate's SSO is a browser redirect flow with no headless (device-code or
+CLI callback) variant, so =warpgate-man= cannot perform an SSO login itself.
+If your Warpgate uses SSO, log in through the web UI as usual, mint a
+personal API token there, and use it as =api-key=.
 
 * Library usage
 
@@ -112,6 +173,19 @@ config = load_config("wgman.yaml")
 server = config.server("prod")
 mgr = WarpgateManager.from_server(server)
 mgr.reconcile_config(config, prune=False)
+#+end_src
+
+The user side is available too — =WarpgateUserClient= reads what one user may
+reach, and =wgman.sshconfig= renders it:
+
+#+begin_src python
+from wgman import WarpgateUserClient, sshconfig
+from wgman.sshconfig import BastionInfo
+
+with WarpgateUserClient("https://warpgate.example.com:8888", "...") as client:
+    info = BastionInfo.from_info(client.get_info(),
+                                 url="https://warpgate.example.com:8888")
+    print(sshconfig.render(client.list_targets(), info))
 #+end_src
 
 * License

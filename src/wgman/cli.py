@@ -25,11 +25,13 @@ import sys
 
 import yaml
 
-from . import __version__
+from . import __version__, sshconfig
+from .client import WarpgateUserClient
 from .config import Config, load_config
 from .exceptions import ConfigError, WgmanError
 from .manager import WarpgateManager
 from .models import ServerConfig
+from .sshconfig import BastionInfo
 from typing import Any
 
 from .odoo import OdooConfig, OdooTargetsConfig, fetch_state
@@ -125,6 +127,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--prune",
         action="store_true",
         help="also delete server-side entities absent from the config",
+    )
+
+    ssh_p = sub.add_parser(
+        "ssh-config",
+        help=(
+            "print an ssh client configuration for the targets your token "
+            "can reach"
+        ),
+        description=(
+            "Ask each configured server which targets the api-key's user "
+            "may reach, and print matching ssh_config(5) stanzas. The "
+            "connection goes through the bastion, so the emitted 'User' is "
+            "the '<user>:<target>' selector, never the backend account. "
+            "Needs a personal API token; the server's global admin token is "
+            "bound to no user and is refused."
+        ),
+    )
+    ssh_p.add_argument(
+        "--prefix",
+        metavar="STR",
+        help=(
+            "prepend STR to every Host alias (default: none for a single "
+            "server, '<server>-' when several are queried)"
+        ),
+    )
+    ssh_p.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        help=(
+            "write to FILE instead of stdout (pair with 'Include FILE' in "
+            "~/.ssh/config)"
+        ),
     )
 
     return parser
@@ -241,6 +276,55 @@ def _run_fetch(config: Config, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _run_ssh_config(config: Config, args: argparse.Namespace) -> int:
+    """Print ssh stanzas for the targets each server's api-key can reach."""
+    servers = _select_servers(config, args.server)
+
+    # Target names are unique per server, not across servers: prefix with the
+    # server name when several are queried, so aliases stay unambiguous.
+    default_prefix = len(servers) > 1
+    sections: list[str] = []
+    for server in servers:
+        prefix = (
+            args.prefix
+            if args.prefix is not None
+            else (f"{server.name}-" if default_prefix else "")
+        )
+        with WarpgateUserClient(
+            server.url, server.api_key, verify_tls=server.verify_tls
+        ) as client:
+            info = BastionInfo.from_info(client.get_info(), url=server.url)
+            targets = client.list_targets()
+
+        rendered = sshconfig.render(
+            targets,
+            info,
+            prefix=prefix,
+            header=f"# {server.name} ({server.url}) — as {info.username}",
+        )
+        if not rendered:
+            print(
+                f"warning: {server.name}: no ssh target reachable by "
+                f"{info.username}",
+                file=sys.stderr,
+            )
+            continue
+        sections.append(rendered)
+
+    output = "\n".join(sections)
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8") as fh:
+                fh.write(output)
+        except OSError as exc:
+            print(f"error: cannot write {args.output}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        print(f"wrote {args.output}", file=sys.stderr)
+    else:
+        print(output, end="")
+    return EXIT_OK
+
+
 def _select_servers(config: Config, name: str | None) -> list[ServerConfig]:
     if name is not None:
         return [config.server(name)]
@@ -289,6 +373,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "fetch":
         try:
             return _run_fetch(config, args)
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        except WgmanError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        except KeyboardInterrupt:
+            print("aborted", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "ssh-config":
+        # Read-only and user-scoped: no desired state is involved, so the
+        # Odoo source and the cross-entity validation do not apply.
+        try:
+            return _run_ssh_config(config, args)
         except ConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_USAGE
