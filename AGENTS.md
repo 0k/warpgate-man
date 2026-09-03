@@ -158,13 +158,20 @@ tries the global admin token first, then the per-user `api_tokens` table.
 - `fetch` loads the config with `strict_env=False`: unset `${ENV}` refs used
   by other sections (e.g. the Warpgate `api-key`) don't block it; a kept
   `${...}` literal in the Odoo password is treated as unset.
-- Transport is `oerpc` (JSON-RPC), a local project at `../oerpc`, wired as
-  the `odoo` extra via `[tool.uv.sources]` until published. Tests inject a
-  fake fetcher instead of mocking oerpc.
+- Transport is `oerpc` (JSON-RPC), pinned as the `odoo` extra to a PEP 508
+  direct reference: `oerpc @ git+https://github.com/0k/oerpc.git@0.0.2`.
+  Tests inject a fake fetcher instead of mocking oerpc.
+- **Never** point that dependency at a local checkout (`[tool.uv.sources]`
+  with `path = "../oerpc"`). It resolves only on the author's machine, so a
+  fresh clone dies with `Distribution not found`, and `pip` — which ignores
+  `[tool.uv.sources]` entirely — looks for a nonexistent `oerpc` on PyPI.
+  `tests/test_packaging.py` guards against reintroducing it. To work against
+  a local oerpc, override it in your own environment
+  (`uv pip install -e ../oerpc` after the sync), never in `pyproject.toml`.
 
 ## Dev
 
 ```sh
-uv sync --extra dev --extra odoo      # odoo extra needs ../oerpc checkout
+uv sync --extra dev --extra odoo      # oerpc comes from its public git tag
 uv run pytest
 ```

@@ -46,7 +46,8 @@ uv pip install -e .
 #+end_src
 
 To use Odoo as a source of desired state, install the =odoo= extra, which
-pulls in the =oerpc= JSON-RPC client:
+pulls in the [[https://github.com/0k/oerpc][=oerpc=]] JSON-RPC client
+straight from its git tag:
 
 #+begin_src sh
 uv pip install -e '.[odoo]'
