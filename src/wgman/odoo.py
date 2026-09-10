@@ -25,12 +25,20 @@ wgman keeps working without it when no Odoo source is used.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .exceptions import ConfigError, WgmanError
 from .models import Role, Target, User
+
+## oerpc scans its own API modules on first session use and logs an ERROR
+## for the Python-2-only xmlrpc ones ("No module named 'cStringIO'"). Those
+## are irrelevant to the JSON-RPC transport we use; a NullHandler stops the
+## default last-resort handler from printing them to stderr, while an
+## explicitly configured root logger still receives oerpc's messages.
+logging.getLogger("oerpc.api").addHandler(logging.NullHandler())
 
 
 def _require(mapping: dict[str, Any], key: str, where: str) -> Any:
