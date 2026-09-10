@@ -147,6 +147,20 @@ def test_output_file(config_file, tmp_path, capsys):
     assert capsys.readouterr().out == ""
 
 
+@respx.mock
+def test_output_file_creates_missing_parent_dirs(config_file, tmp_path, capsys):
+    # The documented usage writes to ~/.ssh/config.d/warpgate, a directory
+    # that does not exist on a fresh machine; the tool must create it rather
+    # than dying with FileNotFoundError.
+    _mock_user_api()
+    dest = tmp_path / "config.d" / "warpgate"
+    rc = main(
+        ["--config", str(config_file), "ssh-config", "--output", str(dest)]
+    )
+    assert rc == 0
+    assert "Host web-01" in dest.read_text()
+
+
 # --------------------------------------------------------------------------- #
 # multi-server
 # --------------------------------------------------------------------------- #
