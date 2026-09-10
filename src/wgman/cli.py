@@ -435,7 +435,10 @@ def _run_ssh_config(config: Config, args: argparse.Namespace) -> int:
 def _emit_ssh_config(output: str, args: argparse.Namespace) -> int:
     """Write the rendered config to ``--output`` or stdout."""
     if args.output:
+        parent = os.path.dirname(args.output)
         try:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(args.output, "w", encoding="utf-8") as fh:
                 fh.write(output)
         except OSError as exc:
