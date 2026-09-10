@@ -153,6 +153,15 @@ absent from the output.
 - `api-key` is *the caller's* token, not necessarily an admin one: the persona
   lives in the token, not in the config schema. Hence one `servers:` section
   for both admin and end-user commands.
+- `api-key` is **optional in the schema** and required only at the point of
+  authentication, via `ServerConfig.require_api_key()`. It authenticates
+  *toward the bastion*; it does not identify a server. An end user's config
+  legitimately declares `name`/`url`/`ssh-host` with no token — that is the
+  premise of `ssh-config --from-odoo`, and a mandatory field forced a lying
+  `api-key: ""`. Both authenticating call sites go through `require_api_key()`
+  (`manager.from_server`, and the `WarpgateUserClient` in
+  `cli._run_ssh_config`); it raises `ConfigError`, which the CLI maps to exit
+  2 (usage), not 1. Never read `server.api_key` directly at a call site.
 - API errors are translated at the client boundary into the `ApiError`
   subclasses (`AuthenticationError` 401, `AuthorizationError` 403,
   `UnsupportedApiError` 404-on-user-API) with messages stating cause and

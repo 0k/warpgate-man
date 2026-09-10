@@ -23,6 +23,12 @@
 # The server's global admin token (--enable-admin-token) is bound to no user,
 # so it administers fine but 'ssh-config' refuses it.
 #
+# 'api-key' is OPTIONAL: it authenticates toward the bastion rather than
+# identifying a server. A config written for an end user may declare a
+# server by 'name', 'url' and 'ssh-host' alone -- enough for
+# 'ssh-config --from-odoo', which contacts Warpgate not at all. Commands
+# that do authenticate refuse with a message naming the server.
+#
 # An end user needs nothing but this section: everything below describes
 # desired state and is used by diff/apply only.
 servers:

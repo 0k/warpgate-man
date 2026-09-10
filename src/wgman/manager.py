@@ -45,10 +45,14 @@ class WarpgateManager:
     def from_server(
         cls, server: ServerConfig, *, timeout: float = 30.0
     ) -> "WarpgateManager":
-        """Build a manager from a :class:`ServerConfig`."""
+        """Build a manager from a :class:`ServerConfig`.
+
+        Raises :class:`ConfigError` if that server declares no ``api-key``:
+        this manager talks to the admin API, so the token is mandatory here.
+        """
         return cls(
             server.url,
-            server.api_key,
+            server.require_api_key(),
             verify_tls=server.verify_tls,
             timeout=timeout,
         )

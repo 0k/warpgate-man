@@ -225,3 +225,29 @@ def test_unknown_server_returns_usage_error(config_file):
         ["--config", str(config_file), "--server", "ghost", "ssh-config"]
     )
     assert rc == 2
+
+
+@respx.mock
+def test_missing_api_key_is_refused_before_any_request(tmp_path, capsys):
+    """This path authenticates, so the token is mandatory here.
+
+    The config is otherwise valid — only ``api-key`` is absent — and no
+    HTTP call may be attempted: respx would raise on an unmocked request,
+    so reaching the network at all fails this test.
+    """
+    p = tmp_path / "wgman.yaml"
+    p.write_text(
+        textwrap.dedent(
+            """
+            servers:
+              - name: prod
+                url: https://wg.example.com:8888
+            """
+        )
+    )
+
+    rc = main(["--config", str(p), "ssh-config"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "server 'prod': no 'api-key'" in err

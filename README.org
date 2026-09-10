@@ -252,6 +252,8 @@ warpgate-man --config wgman.yaml ssh-config --from-odoo -o ~/.ssh/config.d/warpg
 
 The file's =api-key= is not read on this path, so you need no Warpgate
 token and no =${WG_PROD_TOKEN}= in your environment — that is the point.
+The key may be left out of the file altogether: a server entry needs only
+=name=, =url= and =ssh-host= to serve this command.
 
 ** What is going on
 
@@ -387,6 +389,12 @@ is:
 - a *personal API token* (web UI → your profile → API tokens) identifies you
   as a user, and is what the plain =ssh-config= needs;
 - =ssh-config --from-odoo= needs *no* Warpgate token at all.
+
+Accordingly =api-key= is *optional* in the file: it is what authenticates
+toward the bastion, not what identifies a server, so a config written for
+an end user may declare a server by =name=, =url= and =ssh-host= alone. A
+command that does authenticate then refuses with a message naming the
+server and how to fix it, rather than sending an empty token.
 
 A personal token used with =apply= fails with a message saying what it
 lacks, not a bare HTTP 403. The server's global admin token is bound to no

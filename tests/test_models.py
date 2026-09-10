@@ -159,6 +159,53 @@ class TestServerConfig:
         assert s.api_key == "tok"
         assert s.verify_tls is False
 
-    def test_missing_api_key_raises(self):
-        with pytest.raises(ConfigError, match="missing required key 'api-key'"):
-            ServerConfig.from_dict({"name": "p", "url": "https://x"})
+    def test_optional_api_key_parses(self):
+        """No 'api-key' is legal: an end user holds no Warpgate token.
+
+        The key is required to *authenticate*, not to describe a server —
+        see ``require_api_key``.
+        """
+        s = ServerConfig.from_dict(
+            {"name": "p", "url": "https://x", "ssh-host": "bastion"}
+        )
+        assert s.api_key is None
+        assert s.ssh_host == "bastion"
+
+    def test_require_api_key_returns_the_token(self):
+        s = ServerConfig.from_dict(
+            {"name": "p", "url": "https://x", "api-key": "tok"}
+        )
+        assert s.require_api_key() == "tok"
+
+    def test_require_api_key_raises_when_absent(self):
+        s = ServerConfig.from_dict({"name": "p", "url": "https://x"})
+        with pytest.raises(ConfigError, match="server 'p': no 'api-key'"):
+            s.require_api_key()
+
+    def test_no_call_site_reads_api_key_directly(self):
+        """``api_key`` may be None, so every consumer must go through
+        ``require_api_key()``. A direct read would send an empty token and
+        get an opaque 401 instead of a message naming the server.
+
+        Structural, because a new call site added later would not fail any
+        behavioural test — it would simply reintroduce the bad error.
+        """
+        import pathlib
+
+        src = pathlib.Path(__file__).resolve().parent.parent / "src" / "wgman"
+        offenders = []
+        for path in src.rglob("*.py"):
+            for n, line in enumerate(path.read_text().splitlines(), 1):
+                if ".api_key" not in line or "require_api_key" in line:
+                    continue
+                # models.py defines the field and the accessor; client.py
+                # holds the token it was constructed with.
+                if path.name in ("models.py", "client.py"):
+                    continue
+                offenders.append(f"{path.name}:{n}: {line.strip()}")
+
+        assert not offenders, (
+            "these read ServerConfig.api_key directly; use "
+            "require_api_key() so a missing token is reported with its "
+            "server name:\n" + "\n".join(offenders)
+        )

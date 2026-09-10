@@ -432,11 +432,20 @@ class ServerConfig:
 
     They are NOT the admin API endpoint (that is ``url``), and NOT any
     backend machine's address.
+
+    ``api_key`` is likewise optional, because it is what authenticates
+    *toward the bastion* rather than what identifies a server. Commands
+    that never call Warpgate — ``ssh-config --from-odoo``, whose whole
+    premise is that the user holds no token — must be able to read the
+    ``ssh-host`` of a server the config describes without inventing a
+    credential for it. Every code path that does authenticate goes
+    through :meth:`require_api_key`, which fails with a remedy naming the
+    server.
     """
 
     name: str
     url: str
-    api_key: str
+    api_key: str | None = None
     verify_tls: bool = True
     ssh_host: str | None = None
     ssh_port: int | None = None
@@ -445,15 +454,29 @@ class ServerConfig:
     def from_dict(cls, data: dict[str, Any], where: str = "server") -> "ServerConfig":
         name = _require(data, "name", where)
         url = _require(data, "url", f"server {name!r}")
-        api_key = _require(data, "api-key", f"server {name!r}")
         return cls(
             name=name,
             url=url,
-            api_key=api_key,
+            api_key=data.get("api-key"),
             verify_tls=bool(data.get("verify-tls", True)),
             ssh_host=data.get("ssh-host"),
             ssh_port=_optional_port(data.get("ssh-port"), f"server {name!r}"),
         )
+
+    def require_api_key(self) -> str:
+        """The token, or a :class:`ConfigError` naming the server.
+
+        Call this at the point of authentication, never at parse time: a
+        config may legitimately describe a server it holds no token for.
+        """
+        if not self.api_key:
+            raise ConfigError(
+                f"server {self.name!r}: no 'api-key' in config, but this "
+                "command authenticates to Warpgate. Add 'api-key' to that "
+                "server (use ${ENV} for the secret), or use a command that "
+                "needs no token, such as 'ssh-config --from-odoo'"
+            )
+        return self.api_key
 
 
 def _optional_port(value: Any, where: str) -> int | None:

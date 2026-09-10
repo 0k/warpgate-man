@@ -401,7 +401,7 @@ def _run_ssh_config(config: Config, args: argparse.Namespace) -> int:
             else (f"{server.name}-" if default_prefix else "")
         )
         with WarpgateUserClient(
-            server.url, server.api_key, verify_tls=server.verify_tls
+            server.url, server.require_api_key(), verify_tls=server.verify_tls
         ) as client:
             info = BastionInfo.from_info(client.get_info(), url=server.url)
             targets = client.list_targets()
@@ -536,6 +536,11 @@ def main(argv: list[str] | None = None) -> int:
                 server, config, apply=apply, prune=prune
             )
             any_changes = any_changes or changed
+    except ConfigError as exc:
+        # e.g. a server with no 'api-key' on a path that authenticates:
+        # the config is at fault, not the server's answer.
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     except WgmanError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR

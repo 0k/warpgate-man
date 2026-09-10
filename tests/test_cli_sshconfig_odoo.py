@@ -373,6 +373,44 @@ class TestNeedsNoWarpgateCredential:
         assert f"HostName {BASTION}" in out
 
 
+    def test_runs_with_no_api_key_declared_at_all(
+        self, tmp_path, monkeypatch, odoo_stub, capsys
+    ):
+        """An end user's config declares the bastion but holds no token.
+
+        ``api-key`` is what authenticates *toward the bastion*; this path
+        never authenticates, so the key must not be required to describe
+        the server whose ``ssh-host`` we need.
+        """
+        monkeypatch.delenv("WG_TOKEN", raising=False)
+        path = tmp_path / "wgman.yaml"
+        path.write_text(
+            textwrap.dedent(
+                """
+                servers:
+                  - name: prod
+                    url: https://wg.example.com:8888
+                    ssh-host: ssh.wg.example.com
+                    ssh-port: 2222
+
+                odoo:
+                  url: https://odoo.example.com
+                  db: mydb
+                  user: alice@example.com
+                  password: s3cret
+                """
+            )
+        )
+        odoo_stub(fake_query(logins=[{"id": 7, "login": "alice@example.com"}]))
+
+        rc = main(["-c", str(path), "ssh-config", "--from-odoo"])
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "Host jev-prod" in out
+        assert f"HostName {BASTION}" in out
+
+
 class TestWhoamiFailures:
     def test_unknown_login_is_reported_not_silently_empty(
         self, config_file, odoo_stub, capsys

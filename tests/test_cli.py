@@ -95,3 +95,29 @@ def test_unknown_server_returns_usage_error(config_file):
 def test_missing_config_returns_usage_error(tmp_path):
     rc = main(["--config", str(tmp_path / "nope.yaml"), "diff"])
     assert rc == 2
+
+
+@respx.mock
+def test_diff_without_api_key_is_refused_before_any_request(tmp_path, capsys):
+    """The admin path authenticates, so the token is mandatory here.
+
+    Only ``api-key`` is removed from an otherwise valid config. respx
+    raises on unmocked requests, so touching the network fails this test.
+    """
+    p = tmp_path / "wgman.yaml"
+    p.write_text(
+        textwrap.dedent(
+            """
+            servers:
+              - name: prod
+                url: https://wg.example.com:8888
+            roles:
+              - name: admin
+            """
+        )
+    )
+
+    rc = main(["--config", str(p), "diff"])
+
+    assert rc == 2
+    assert "server 'prod': no 'api-key'" in capsys.readouterr().err
