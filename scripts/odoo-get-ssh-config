@@ -1,0 +1,424 @@
+#!/bin/bash
+# Generate an ssh client config from Odoo, on a machine that has nothing.
+#
+# Bootstraps what is missing (uv, and the git/curl it needs), asks once for
+# the four values that identify your Odoo and your bastion, remembers them
+# in the config file warpgate-man already reads, and then delegates to the
+# published package:
+#
+#   uvx --from 'warpgate-man[odoo] @ git+...' warpgate-man ssh-config --from-odoo
+#
+# stdout carries the ssh config and NOTHING else, so this works:
+#
+#   odoo-get-ssh-config > ~/.ssh/config.d/warpgate
+#
+# Every prompt, question and progress line goes to stderr, and prompts are
+# read from /dev/tty, so redirecting stdout keeps the script interactive.
+
+set -euo pipefail
+
+## Piped to an interpreter (`curl ... | bash`), $0 is the shell itself, so
+## every message would read "bash: error:" and the usage examples would
+## name "bash". Fall back to the real name in that case.
+exname="$(basename "$0")"
+case "$exname" in
+    bash|sh|dash|zsh|-*) exname="odoo-get-ssh-config" ;;
+esac
+version="0.1.0"
+
+## The published package, never a local checkout: this script is meant to
+## run on a machine that has no clone of this repository.
+PACKAGE_SPEC="warpgate-man[odoo] @ git+https://github.com/0k/warpgate-man.git"
+
+## Overridable for tests and for unusual setups.
+WGMAN_CONFIG="${WGMAN_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/wgman/config.yaml}"
+UV_INSTALLER_URL="${UV_INSTALLER_URL:-https://astral.sh/uv/install.sh}"
+
+EXIT_OK=0
+EXIT_ERROR=1
+EXIT_USAGE=2
+
+# --------------------------------------------------------------------------- #
+# Colour
+#
+# Colour is decoration on the CONVERSATION, which lives on stderr, so the
+# test is whether stderr is a terminal -- not stdout, which is the ssh
+# config and is usually redirected to a file. Honours NO_COLOR
+# (https://no-color.org/) and TERM=dumb.
+# --------------------------------------------------------------------------- #
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+else
+    C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE=""
+fi
+
+c_dim()    { printf '%s' "$C_DIM$*$C_RESET"; }
+c_bold()   { printf '%s' "$C_BOLD$*$C_RESET"; }
+c_prompt() { printf '%s' "$C_BOLD$C_BLUE$*$C_RESET"; }
+c_ok()     { printf '%s' "$C_GREEN$*$C_RESET"; }
+
+## Every diagnostic goes to stderr; stdout is reserved for the ssh config.
+die()  { echo "$C_BOLD$C_RED$exname: error:$C_RESET $*" >&2; exit "$EXIT_ERROR"; }
+usage_error() {
+    echo "$C_BOLD$C_RED$exname: error:$C_RESET $*" >&2; exit "$EXIT_USAGE"
+}
+warn() { echo "$C_BOLD$C_YELLOW$exname: warning:$C_RESET $*" >&2; }
+info() { echo "$*" >&2; }
+step() { echo "$C_BOLD$C_BLUE==>$C_RESET $C_BOLD$*$C_RESET" >&2; }
+note() { echo "$C_DIM$*$C_RESET" >&2; }
+
+print_usage() {
+    cat <<EOF
+Usage: $exname [OPTIONS]
+
+Generate an ssh client config for the machines Odoo says you may reach,
+through your Warpgate bastion.  Writes the config to stdout.
+
+On first run this asks for your Odoo server, database, login and bastion
+address, and saves them to:
+
+    $WGMAN_CONFIG
+
+The database may be left empty: the server is then asked, which works
+when it hosts exactly one.
+
+Later runs reuse that file and ask only for your Odoo password.
+
+Prompts offering to install a prerequisite default to yes, so a bare
+Enter accepts; answer 'n' to refuse.
+
+Options:
+  -c, --config FILE   configuration file (default: \$WGMAN_CONFIG or the path
+                      above)
+  -o, --output FILE   write the ssh config to FILE instead of stdout
+  -y, --yes           assume yes: install missing prerequisites without asking
+  -n, --no-install    never install anything; fail if a prerequisite is missing
+      --reconfigure   ask for the Odoo/bastion values again, replacing the
+                      saved ones
+  -h, --help          show this help and exit
+  -V, --version       show version and exit
+
+Environment:
+  WGMAN_CONFIG        default configuration file path
+  ODOO_PASSWORD       Odoo password; when unset you are prompted for it
+  NO_COLOR            set to any value to disable coloured output
+
+Examples:
+  $exname > ~/.ssh/config.d/warpgate
+  $exname -o ~/.ssh/config.d/warpgate
+  $exname --reconfigure
+
+Then add this once to ~/.ssh/config:
+
+  Include config.d/warpgate
+EOF
+}
+
+# --------------------------------------------------------------------------- #
+# Prompting
+#
+# Read from /dev/tty rather than stdin so that `$exname > file` stays
+# interactive.  With no tty there is nobody to answer: say what is missing
+# and how to supply it non-interactively.
+# --------------------------------------------------------------------------- #
+## Test by OPENING /dev/tty, not by stat-ing it: in a container or under
+## nohup the device node exists and looks readable, yet opening it fails
+## with ENXIO. A stat-based check would print a prompt nobody can answer.
+has_tty() { { : < /dev/tty; } 2>/dev/null; }
+
+prompt_value() {  # prompt_value VARNAME "Question" ["default"]
+    local -n _value_ref="$1"
+    local question="$2" default="${3:-}" answer=""
+
+    has_tty || die "no terminal to ask '$question' on: run this interactively" \
+                   "once to create $WGMAN_CONFIG, or write that file yourself"
+
+    while true; do
+        if [ -n "$default" ]; then
+            printf '%s %s: ' "$(c_prompt "$question")" "$(c_dim "[$default]")" >&2
+        else
+            printf '%s: ' "$(c_prompt "$question")" >&2
+        fi
+        IFS= read -r answer < /dev/tty || die "aborted"
+        [ -z "$answer" ] && answer="$default"
+        [ -n "$answer" ] && break
+        warn "a value is required"
+    done
+    _value_ref="$answer"
+}
+
+## Like prompt_value, but an empty answer is a legitimate one meaning
+## "leave it unset". Used for the Odoo database, which the server names
+## itself when it hosts only one.
+prompt_optional() {  # prompt_optional VARNAME "Question"
+    local -n _optional_ref="$1"
+    local question="$2" answer=""
+
+    has_tty || die "no terminal to ask '$question' on: run this interactively" \
+                   "once to create $WGMAN_CONFIG, or write that file yourself"
+
+    printf '%s: ' "$(c_prompt "$question")" >&2
+    IFS= read -r answer < /dev/tty || die "aborted"
+    _optional_ref="$answer"
+}
+
+prompt_secret() {  # prompt_secret VARNAME "Question"
+    local -n _secret_ref="$1"
+    local question="$2" answer=""
+
+    has_tty || die "no terminal to ask '$question' on: set ODOO_PASSWORD" \
+                   "in the environment to run non-interactively"
+
+    printf '%s: ' "$(c_prompt "$question")" >&2
+    stty -echo < /dev/tty
+    IFS= read -r answer < /dev/tty || { stty echo < /dev/tty; die "aborted"; }
+    stty echo < /dev/tty
+    printf '\n' >&2
+    _secret_ref="$answer"
+}
+
+## Defaults to YES: the script is offering to do the very thing the user
+## ran it for, so a bare Enter should proceed. An explicit 'n' still
+## refuses, and --no-install refuses everything without asking.
+confirm() {  # confirm "Question"  -> 0 yes, 1 no
+    local question="$1" answer=""
+
+    [ "$assume_yes" = "yes" ] && return 0
+    [ "$no_install" = "yes" ] && return 1
+    has_tty || return 1
+
+    printf '%s %s: ' "$(c_prompt "$question")" "$(c_dim '[Y/n]')" >&2
+    IFS= read -r answer < /dev/tty || return 1
+    case "$answer" in [nN]|[nN][oO]) return 1 ;; *) return 0 ;; esac
+}
+
+# --------------------------------------------------------------------------- #
+# Prerequisites
+# --------------------------------------------------------------------------- #
+detect_package_manager() {
+    local mgr
+    for mgr in apt-get dnf yum pacman zypper apk brew; do
+        command -v "$mgr" >/dev/null 2>&1 && { echo "$mgr"; return 0; }
+    done
+    return 1
+}
+
+## Package installs need root unless we are root or using brew (which
+## refuses to run as root by design).
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        die "need root to install packages, and sudo is not available:" \
+            "install the missing tool yourself, then re-run $exname"
+    fi
+}
+
+install_package() {  # install_package TOOL
+    local tool="$1" mgr
+    mgr="$(detect_package_manager)" || die \
+        "no supported package manager found: install '$tool' yourself," \
+        "then re-run $exname"
+
+    step "Installing $tool with $mgr..."
+    case "$mgr" in
+        apt-get) as_root apt-get update -qq && as_root apt-get install -y "$tool" ;;
+        dnf|yum) as_root "$mgr" install -y "$tool" ;;
+        pacman)  as_root pacman -Sy --noconfirm "$tool" ;;
+        zypper)  as_root zypper --non-interactive install "$tool" ;;
+        apk)     as_root apk add --no-cache "$tool" ;;
+        brew)    brew install "$tool" ;;
+    esac || die "installing '$tool' failed; install it yourself and re-run $exname"
+}
+
+ensure_tool() {  # ensure_tool TOOL "why it is needed"
+    local tool="$1" why="$2"
+    command -v "$tool" >/dev/null 2>&1 && return 0
+
+    info "$(c_bold "'$tool'") is not installed, and is needed $why."
+    [ "$no_install" = "yes" ] && die "'$tool' is missing and --no-install was given"
+    confirm "Install '$tool' now?" || die \
+        "'$tool' is required: install it yourself, then re-run $exname"
+    install_package "$tool"
+    command -v "$tool" >/dev/null 2>&1 || die \
+        "'$tool' still not found after installing it"
+    info "$(c_ok "ok") $tool is available"
+}
+
+## uv's own installer drops it in ~/.local/bin and needs no root.  It does
+## NOT touch the PATH of the shell that ran it, so add it ourselves.
+ensure_uv() {
+    command -v uv >/dev/null 2>&1 && return 0
+
+    local uv_bin="${XDG_BIN_HOME:-$HOME/.local/bin}"
+    if [ -x "$uv_bin/uv" ]; then
+        PATH="$uv_bin:$PATH"
+        export PATH
+        return 0
+    fi
+
+    info "$(c_bold "'uv'") is not installed. It runs warpgate-man without a virtualenv,"
+    note "and installs into your home directory (no root needed)."
+    [ "$no_install" = "yes" ] && die "'uv' is missing and --no-install was given"
+    confirm "Install 'uv' from $UV_INSTALLER_URL?" || die \
+        "'uv' is required: see https://docs.astral.sh/uv/ then re-run $exname"
+
+    ensure_tool curl "to download the uv installer"
+    step "Installing uv..."
+    curl -LsSf "$UV_INSTALLER_URL" | sh >&2 \
+        || die "the uv installer failed"
+
+    PATH="$uv_bin:$PATH"
+    export PATH
+    command -v uv >/dev/null 2>&1 || die \
+        "uv was installed but is not on PATH; add $uv_bin to your PATH"
+    info "$(c_ok "ok") uv is available"
+}
+
+# --------------------------------------------------------------------------- #
+# Configuration
+#
+# The file we write is the one warpgate-man already reads, in the location
+# it already searches -- this script introduces no config format of its own.
+# 'api-key' is deliberately absent: it authenticates toward the bastion, and
+# this path never does.
+# --------------------------------------------------------------------------- #
+create_config() {
+    local odoo_url="" odoo_db="" odoo_login="" bastion=""
+
+    step "Setting up $WGMAN_CONFIG"
+    note "Your manager can give you these; the database is usually blank."
+    info ""
+
+    prompt_value odoo_url    "  Odoo URL$(c_dim ' (e.g. https://odoo.example.com)')"
+    prompt_optional odoo_db  "  Odoo database$(c_dim ' (leave empty to use the server default)')"
+    prompt_value odoo_login  "  Your Odoo login$(c_dim ' (e.g. you@example.com)')"
+    prompt_value bastion     "  Warpgate bastion ssh address$(c_dim ' (HOST[:PORT])')" \
+                             "warpgate.example.com:2222"
+
+    local ssh_host="${bastion%%:*}" ssh_port="${bastion##*:}"
+    [ "$ssh_port" = "$bastion" ] && ssh_port=22
+    case "$ssh_port" in
+        ''|*[!0-9]*) usage_error "invalid bastion port in '$bastion'" ;;
+    esac
+
+    ## An empty answer means "let the server say". Emit the key only when
+    ## it has a value: 'db:' with nothing after it parses as null, which
+    ## is not the same as absent to a stricter reader.
+    local db_line=""
+    if [ -n "$odoo_db" ]; then
+        db_line="  db: $odoo_db"
+    else
+        db_line="  # db: omitted -- the server names its own database"
+    fi
+
+    mkdir -p -- "$(dirname -- "$WGMAN_CONFIG")" \
+        || die "cannot create $(dirname -- "$WGMAN_CONFIG")"
+
+    ## Written with 0600: it names your Odoo account. The password is never
+    ## stored -- it is asked for on every run, or taken from ODOO_PASSWORD.
+    local old_umask
+    old_umask="$(umask)"
+    umask 077
+    cat > "$WGMAN_CONFIG" <<EOF || { umask "$old_umask"; die "cannot write $WGMAN_CONFIG"; }
+# warpgate-man configuration, written by $exname.
+#
+# Regenerate your ssh config at any time with:
+#
+#     $exname > ~/.ssh/config.d/warpgate
+#
+# 'api-key' is absent on purpose: it authenticates toward the Warpgate
+# bastion, and 'ssh-config --from-odoo' never contacts Warpgate at all.
+
+servers:
+  - name: bastion
+    url: https://$ssh_host
+    ssh-host: $ssh_host
+    ssh-port: $ssh_port
+
+odoo:
+  url: $odoo_url
+$db_line
+  user: $odoo_login
+  password: \${ODOO_PASSWORD}
+EOF
+    umask "$old_umask"
+
+    info ""
+    info "$(c_ok "ok") wrote $WGMAN_CONFIG"
+    info ""
+}
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+assume_yes="no"
+no_install="no"
+reconfigure="no"
+output=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)    print_usage; exit "$EXIT_OK" ;;
+        -V|--version) echo "$exname $version"; exit "$EXIT_OK" ;;
+        -c|--config)
+            [ $# -ge 2 ] || usage_error "$1 requires a FILE argument"
+            WGMAN_CONFIG="$2"; shift 2 ;;
+        -o|--output)
+            [ $# -ge 2 ] || usage_error "$1 requires a FILE argument"
+            output="$2"; shift 2 ;;
+        -y|--yes)        assume_yes="yes"; shift ;;
+        -n|--no-install) no_install="yes"; shift ;;
+        --reconfigure)   reconfigure="yes"; shift ;;
+        --) shift; break ;;
+        -*) usage_error "unknown option '$1' (try --help)" ;;
+        *)  usage_error "unexpected argument '$1' (try --help)" ;;
+    esac
+done
+
+if [ "$assume_yes" = "yes" ] && [ "$no_install" = "yes" ]; then
+    usage_error "--yes and --no-install contradict each other"
+fi
+
+ensure_uv
+## uvx fetches warpgate-man and oerpc from git, so git is not optional.
+ensure_tool git "to fetch warpgate-man and its Odoo client"
+
+if [ "$reconfigure" = "yes" ] || [ ! -f "$WGMAN_CONFIG" ]; then
+    create_config
+else
+    info "Using $WGMAN_CONFIG $(c_dim '(--reconfigure to change it)')"
+fi
+
+## The password is never written to the config; the file references
+## ${ODOO_PASSWORD} and we supply it for this run only.
+if [ -z "${ODOO_PASSWORD:-}" ]; then
+    prompt_secret ODOO_PASSWORD "Odoo password"
+    export ODOO_PASSWORD
+fi
+
+step "Fetching your targets from Odoo..."
+
+## uvx writes its own progress to stderr, so stdout stays clean data.
+## --output is passed through so warpgate-man writes the file itself.
+set -- --from "$PACKAGE_SPEC" warpgate-man ssh-config --from-odoo
+[ -n "$output" ] && set -- "$@" --output "$output"
+
+uvx "$@" || die "warpgate-man failed to generate the ssh config"
+
+if [ -n "$output" ]; then
+    info ""
+    info "$(c_ok "ok") wrote $output"
+    note "Add this once to ~/.ssh/config, if it is not there yet:"
+    info ""
+    info "    $(c_bold "Include ${output/#$HOME\//}")"
+    info ""
+fi

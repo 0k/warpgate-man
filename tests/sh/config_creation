@@ -1,0 +1,138 @@
+# -*- mode: shell-script -*-
+# First run asks for the four values and writes a config warpgate-man reads.
+#
+# The prompts are read from /dev/tty, not stdin, so these tests drive the
+# script under `script(1)` to give it a pseudo-terminal. Feeding stdin
+# would not exercise the path users actually hit.
+#
+# Each scenario is ONE `try` that walks the whole run and prints one line
+# per check: sunit re-runs setup() for every try, which would otherwise
+# wipe the config the previous try had just created.
+
+source "$base/tests/sh/helpers.sh"
+
+# `try` runs its command in a fresh `bash -c` where the helpers above are
+# not in scope, and `$(ogsc_path)` inside a try string is evaluated THERE.
+# Without this the PATH would come out empty and every command would fail
+# with 127 — an obscure way to fail a test about prompting.
+prefix_cmd="
+source '$base/tests/sh/helpers.sh'
+"
+
+setup() {
+    ogsc_init
+}
+
+try '
+cd "$test_tmpdir"
+printf "https://odoo.example.com\nmydb\nyou@example.com\nwarpgate.example.com:2222\n" \
+    > answers
+script -qec "PATH=\"$(ogsc_path)\" \
+OGSC_CALLS=\"$test_tmpdir/calls\" \
+ODOO_PASSWORD=secret \
+\"'$script_under_test'\" -c \"$test_tmpdir/sandbox/new.yaml\" \
+    -o \"$test_tmpdir/out.sshconfig\"" /dev/null < answers > /dev/null 2>&1
+echo "rc=$?"
+
+cfg="$test_tmpdir/sandbox/new.yaml"
+grep -q "url: https://odoo.example.com" "$cfg" && echo "odoo-url-ok"
+grep -q "db: mydb"                      "$cfg" && echo "odoo-db-ok"
+grep -q "user: you@example.com"         "$cfg" && echo "odoo-user-ok"
+grep -q "ssh-host: warpgate.example.com" "$cfg" && echo "ssh-host-ok"
+grep -q "ssh-port: 2222"                "$cfg" && echo "ssh-port-ok"
+
+# api-key authenticates toward the bastion, and this path never does.
+# Inventing one would be a lie; warpgate-man no longer requires it. The
+# words appear in an explanatory comment, so match the DIRECTIVE: a real
+# key would be an "api-key:" mapping at the start of a line.
+grep -qE "^[[:space:]]*-?[[:space:]]*api-key:" "$cfg" || echo "no-api-key-ok"
+
+# The password is asked for each run, or read from the environment. A
+# credential in a file users forward to support is a leak.
+grep -q "secret" "$cfg" || echo "password-not-stored-ok"
+grep -q "password: ..ODOO_PASSWORD." "$cfg" && echo "password-is-env-ref-ok"
+
+# It names an Odoo account: not world-readable.
+echo "mode=$(stat -c "%a" "$cfg")"
+
+# The delegation must target the PUBLISHED package, never a checkout.
+grep -q "git+https://github.com/0k/warpgate-man.git" "$test_tmpdir/calls" \
+    && echo "uses-published-package-ok"
+grep -q -- "--from-odoo" "$test_tmpdir/calls" && echo "from-odoo-ok"
+' "first run: prompts, writes the config, delegates"
+is out 'rc=0
+odoo-url-ok
+odoo-db-ok
+odoo-user-ok
+ssh-host-ok
+ssh-port-ok
+no-api-key-ok
+password-not-stored-ok
+password-is-env-ref-ok
+mode=600
+uses-published-package-ok
+from-odoo-ok' TRIM
+
+# An empty database answer is a legitimate one: the server names its own
+# when it hosts a single database. Emitting a bare 'db:' would parse as
+# null, so the key must be absent entirely.
+try '
+cd "$test_tmpdir"
+printf "https://odoo.example.com\n\nyou@example.com\nwarpgate.example.com:2222\n" \
+    > answers
+script -qec "PATH=\"$(ogsc_path)\" \
+OGSC_CALLS=\"$test_tmpdir/calls\" \
+ODOO_PASSWORD=secret \
+\"'$script_under_test'\" -c \"$test_tmpdir/sandbox/nodb.yaml\"" \
+    /dev/null < answers > /dev/null 2>&1
+echo "rc=$?"
+cfg="$test_tmpdir/sandbox/nodb.yaml"
+grep -qE "^[[:space:]]*db:" "$cfg" || echo "no-db-key-emitted"
+grep -q "user: you@example.com" "$cfg" && echo "later-answers-not-shifted"
+' "an empty database answer omits the key"
+is out 'rc=0
+no-db-key-emitted
+later-answers-not-shifted' TRIM
+
+# A bastion typed without a port must default to 22 rather than produce an
+# empty or malformed 'ssh-port', which warpgate-man would reject.
+try '
+cd "$test_tmpdir"
+printf "https://odoo.example.com\nmydb\nyou@example.com\nbastion.example.com\n" \
+    > answers
+script -qec "PATH=\"$(ogsc_path)\" \
+OGSC_CALLS=\"$test_tmpdir/calls\" \
+ODOO_PASSWORD=secret \
+\"'$script_under_test'\" -c \"$test_tmpdir/sandbox/noport.yaml\"" \
+    /dev/null < answers > /dev/null 2>&1
+grep "ssh-port:" "$test_tmpdir/sandbox/noport.yaml"
+' "a portless bastion defaults to 22"
+is out part "ssh-port: 22"
+
+# An existing config is reused verbatim: no prompts, no rewrite.
+try '
+cd "$test_tmpdir"
+cat > "$test_tmpdir/sandbox/config.yaml" <<EOF
+servers:
+  - name: bastion
+    url: https://warpgate.example.com
+    ssh-host: warpgate.example.com
+    ssh-port: 2222
+
+odoo:
+  url: https://odoo.example.com
+  db: mydb
+  user: you@example.com
+  password: \${ODOO_PASSWORD}
+EOF
+before="$(md5sum < "$test_tmpdir/sandbox/config.yaml")"
+PATH="$(ogsc_path)" \
+OGSC_CALLS="$test_tmpdir/calls" \
+ODOO_PASSWORD=secret \
+"'$script_under_test'" -c "$test_tmpdir/sandbox/config.yaml" >/dev/null 2>&1
+echo "rc=$?"
+after="$(md5sum < "$test_tmpdir/sandbox/config.yaml")"
+[ "$before" = "$after" ] && echo "config-untouched"
+' "a second run reuses the config without asking"
+is out 'rc=0
+config-untouched' TRIM

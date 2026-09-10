@@ -1,0 +1,132 @@
+# -*- mode: shell-script -*-
+# Nothing is installed without consent, and a refusal explains the way out.
+#
+# The fake package manager records what it was asked to install instead of
+# installing it: a test that really ran apt-get would need root and would
+# mutate the machine running the suite.
+
+source "$base/tests/sh/helpers.sh"
+
+# `try` runs its command in a fresh `bash -c`, where the helpers sourced
+# above are NOT in scope: an unavailable `ogsc_remove_tool` would fail
+# silently and the test would pass for the wrong reason. Source them into
+# the try shell too.
+prefix_cmd="
+source '$base/tests/sh/helpers.sh'
+"
+
+setup() {
+    ogsc_init
+    ogsc_write_config
+}
+
+# --no-install must refuse rather than install, and name the missing tool.
+try '
+cd "$test_tmpdir"
+ogsc_remove_tool git
+PATH="$(ogsc_path)" \
+OGSC_CALLS="$test_tmpdir/calls" \
+ODOO_PASSWORD=secret \
+"'$script_under_test'" -c "$test_tmpdir/sandbox/config.yaml" -n \
+    > "$test_tmpdir/stdout" 2> "$test_tmpdir/stderr" < /dev/null
+echo "rc=$?"
+' "--no-install refuses a missing git"
+is out "rc=1" TRIM
+
+try 'cat "$test_tmpdir/stderr"' "and says which tool and why"
+is out part "git"
+is out part "--no-install"
+
+try 'cat "$test_tmpdir/stdout"' "with nothing on stdout"
+is out ""
+
+# Declining the prompt must leave the machine untouched and say what to do.
+# 'n' is now the NON-default answer, so this also proves refusal still works.
+try '
+cd "$test_tmpdir"
+ogsc_remove_tool git
+printf "n\n" > answers
+script -qec "PATH=\"$(ogsc_path)\" \
+OGSC_CALLS=\"$test_tmpdir/calls\" \
+ODOO_PASSWORD=secret \
+\"'$script_under_test'\" -c \"$test_tmpdir/sandbox/config.yaml\"" \
+    /dev/null < answers > "$test_tmpdir/tty-out" 2>&1
+echo "rc=$?"
+grep -q "install it yourself" "$test_tmpdir/tty-out" && echo "explains-the-way-out"
+grep -q "^apt-get" "$test_tmpdir/calls" 2>/dev/null || echo "installed-nothing"
+' "declining the prompt installs nothing"
+is out 'rc=1
+explains-the-way-out
+installed-nothing' TRIM
+
+# A bare Enter ACCEPTS: the script is offering to do the thing the user ran
+# it for, so the default must be yes. The fake package manager records the
+# install instead of performing it.
+try '
+cd "$test_tmpdir"
+ogsc_remove_tool git
+ogsc_fake_package_manager
+printf "\n" > answers
+script -qec "PATH=\"$(ogsc_path)\" \
+OGSC_CALLS=\"$test_tmpdir/calls\" \
+ODOO_PASSWORD=secret \
+\"'$script_under_test'\" -c \"$test_tmpdir/sandbox/config.yaml\"" \
+    /dev/null < answers > "$test_tmpdir/tty-out" 2>&1
+grep -q "\[Y/n\]" "$test_tmpdir/tty-out" && echo "prompt-defaults-to-yes"
+grep -q "apt-get install -y git" "$test_tmpdir/calls" && echo "accepted-on-bare-enter"
+' "a bare Enter accepts the install"
+is out 'prompt-defaults-to-yes
+accepted-on-bare-enter' TRIM
+
+# With no terminal there is nobody to consent, so it must not hang waiting
+# on a prompt: refuse with an actionable message instead.
+try '
+cd "$test_tmpdir"
+ogsc_remove_tool git
+setsid env PATH="$(ogsc_path)" \
+    OGSC_CALLS="$test_tmpdir/calls" \
+    ODOO_PASSWORD=secret \
+    "'$script_under_test'" -c "$test_tmpdir/sandbox/config.yaml" \
+    < /dev/null > /dev/null 2> "$test_tmpdir/stderr"
+echo "rc=$?"
+grep -q "install it yourself" "$test_tmpdir/stderr" && echo "actionable"
+' "no tty: refuses instead of hanging"
+is out 'rc=1
+actionable' TRIM
+
+# A present tool is used as-is: no prompt, no install.
+try '
+cd "$test_tmpdir"
+PATH="$(ogsc_path)" \
+OGSC_CALLS="$test_tmpdir/calls" \
+ODOO_PASSWORD=secret \
+"'$script_under_test'" -c "$test_tmpdir/sandbox/config.yaml" \
+    > /dev/null 2> "$test_tmpdir/stderr" < /dev/null
+echo "rc=$?"
+grep -q "is not installed" "$test_tmpdir/stderr" || echo "no-install-talk"
+' "existing tools are used without prompting"
+is out 'rc=0
+no-install-talk' TRIM
+
+# A failing delegate must surface as a failure, not a silent empty config
+# that would overwrite a good ~/.ssh/config.d/warpgate with nothing.
+try '
+cd "$test_tmpdir"
+cat > "$test_tmpdir/sandbox/bin/uvx" <<EOF
+#!/bin/bash
+echo "error: odoo rejected the credentials" >&2
+exit 1
+EOF
+chmod +x "$test_tmpdir/sandbox/bin/uvx"
+PATH="$(ogsc_path)" \
+OGSC_CALLS="$test_tmpdir/calls" \
+ODOO_PASSWORD=secret \
+"'$script_under_test'" -c "$test_tmpdir/sandbox/config.yaml" \
+    > "$test_tmpdir/stdout" 2> "$test_tmpdir/stderr" < /dev/null
+echo "rc=$?"
+[ -s "$test_tmpdir/stdout" ] || echo "no-partial-config-on-stdout"
+grep -q "failed to generate" "$test_tmpdir/stderr" && echo "reported"
+' "a failing warpgate-man is reported, not swallowed"
+is out 'rc=1
+no-partial-config-on-stdout
+reported' TRIM

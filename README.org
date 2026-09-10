@@ -255,6 +255,73 @@ token and no =${WG_PROD_TOKEN}= in your environment — that is the point.
 The key may be left out of the file altogether: a server entry needs only
 =name=, =url= and =ssh-host= to serve this command.
 
+** If you only need it once
+
+Generating an ssh config is a once-in-a-while errand, so you do not have to
+install anything for it. =uvx= fetches =warpgate-man=, runs it, and keeps
+nothing:
+
+#+begin_src sh
+uvx --from 'warpgate-man[odoo] @ git+https://github.com/0k/warpgate-man.git' \
+    warpgate-man --odoo-url https://odoo.example.com --odoo-db mydb \
+                 --odoo-user you@example.com \
+                 ssh-config --from-odoo --bastion warpgate.example.com:2222 \
+                 -o ~/.ssh/config.d/warpgate
+#+end_src
+
+It prompts for your Odoo password and writes the same file as above. All
+you need on the machine is =uv= and =git= (see [[*Installation][Installation]]) — no
+virtualenv, no config file, and no Warpgate token.
+
+The three =--odoo-*= flags are what replace the config file here, so give
+all three; with only some of them =warpgate-man= looks for a =wgman.yaml=
+and stops when there is none.
+
+** The scripted way
+
+If even that is too much to remember, =odoo-get-ssh-config= does the whole
+thing on a machine that has nothing installed. It checks for =uv= (and the
+=git=/=curl= it needs), offers to install what is missing, asks once for
+your Odoo server, database, login and bastion address, saves them to
+=~/.config/wgman/config.yaml=, and prints the ssh config.
+
+It is a single self-contained script, so you need no clone to get it:
+
+#+begin_src sh
+curl -LsSfO https://raw.githubusercontent.com/0k/warpgate-man/master/scripts/odoo-get-ssh-config
+chmod +x odoo-get-ssh-config
+./odoo-get-ssh-config > ~/.ssh/config.d/warpgate
+#+end_src
+
+Read it before running it, as with anything you download. To keep it
+around, move it onto your =PATH= (=~/.local/bin= is the usual spot):
+
+#+begin_src sh
+mv odoo-get-ssh-config ~/.local/bin/
+#+end_src
+
+For a true one-liner, pipe it straight to =bash= — its prompts are read
+from the terminal, not stdin, so they still work when the script itself
+arrives on stdin:
+
+#+begin_src sh
+curl -LsSf https://raw.githubusercontent.com/0k/warpgate-man/master/scripts/odoo-get-ssh-config \
+    | bash > ~/.ssh/config.d/warpgate
+#+end_src
+
+From a checkout it is =./scripts/odoo-get-ssh-config=, with no
+difference in behaviour.
+
+Only the ssh config goes to stdout — every question and progress line
+goes to stderr, and the prompts are read from the terminal — so the
+redirection above works while the script is still interactive. Later runs
+reuse the saved answers and ask only for your Odoo password, which is
+never written to disk (=--reconfigure= to change them).
+
+Nothing is installed without asking; =--yes= accepts in advance and
+=--no-install= refuses outright, failing with the name of what is
+missing. Run =--help= for the rest.
+
 ** What is going on
 
 Your =ssh= client only ever talks to the *bastion*. The machine you want is

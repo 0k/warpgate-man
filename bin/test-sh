@@ -1,0 +1,25 @@
+#!/bin/bash
+# Test runner for the bash helpers in scripts/.
+#
+# The Python suite is run with `uv run pytest`; this covers what pytest
+# cannot: the shell script users run before warpgate-man is installed.
+
+exname="$(basename "$0")"
+
+self_dir=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
+base=$(realpath -- "$self_dir/..")
+export base
+
+export PROFILE_STORE_DIR="$base/.profiles"
+
+command -v sunit >/dev/null 2>&1 || {
+    echo "$exname: sunit is not installed (see ~/dev/sh/sunit)" >&2
+    exit 1
+}
+
+cd "$base/tests/sh" || {
+    echo "$exname: cannot cd to $base/tests/sh" >&2
+    exit 1
+}
+
+exec sunit -e helpers.sh "$@"
