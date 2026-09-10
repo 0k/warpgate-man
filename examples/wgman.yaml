@@ -61,7 +61,11 @@ servers:
 # is no --odoo-password on purpose (it would leak into ps / shell history).
 #odoo:
 #  url: https://odoo.example.com
-#  db: mydb
+#  db: mydb                       # optional: omit and the server is asked,
+#                                 # which works when it hosts exactly one
+#                                 # database (several, or a server with
+#                                 # database listing disabled, is an error
+#                                 # telling you to name it here)
 #  user: sync@example.com
 #  # password: ${ODOO_PASSWORD}   # omit to be prompted interactively
 #  verify-tls: true               # optional, default true

@@ -53,6 +53,12 @@ DEFAULT_TARGETS_DOMAIN: list[Any] = [[TARGETS_FIELD, "!=", False]]
 
 _DOMAIN_OPERATORS = ("|", "&", "!")
 
+# Odoo's own login screen asks here which databases exist; it needs no
+# authentication, which is what lets us resolve the database before login.
+_DATABASE_LIST_PATH = "/web/database/list"
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
+_MAX_REDIRECTS = 5
+
 # [user@]HOST[:PORT] — HOST is a domain name or IP (no spaces, no '@'/':').
 _SSH_TARGET_RE = re.compile(
     r"""^
@@ -146,11 +152,17 @@ class OdooUserSelection:
 
 @dataclass
 class OdooConfig:
-    """Connection details + selection config for the Odoo source."""
+    """Connection details + selection config for the Odoo source.
+
+    ``db`` is optional: an Odoo server names its own databases on an
+    unauthenticated endpoint, so when exactly one exists there is nothing
+    to ask. See :func:`resolve_database` — it is required only when the
+    server hosts several, or refuses to list them.
+    """
 
     url: str
-    db: str
     user: str
+    db: str | None = None
     password: str | None = None
     verify_tls: bool = True
     targets: OdooTargetsConfig = field(default_factory=OdooTargetsConfig)
@@ -164,8 +176,8 @@ class OdooConfig:
             raise ConfigError(f"{where}.users: must be a list of selections")
         return cls(
             url=_require(data, "url", where),
-            db=_require(data, "db", where),
             user=_require(data, "user", where),
+            db=data.get("db"),
             password=data.get("password"),
             verify_tls=bool(data.get("verify-tls", True)),
             targets=(
@@ -258,17 +270,99 @@ def _import_oerpc() -> tuple[Any, type[BaseException], type[BaseException]]:
     return Odoo, ApiError, RpcError
 
 
+def resolve_database(config: OdooConfig) -> str:
+    """The database to log into: the declared one, or the server's own.
+
+    A declared ``db`` wins and is returned without contacting anything.
+    Otherwise Odoo is asked, over the unauthenticated
+    ``/web/database/list`` endpoint it exposes for its own login screen —
+    this runs BEFORE the login that needs the answer, so it cannot use the
+    authenticated session.
+
+    Exactly one database is adopted silently. Anything else raises rather
+    than guesses: picking one of several would quietly operate on the
+    wrong data, and a server with ``list_db = False`` (standard
+    hardening) simply cannot answer.
+    """
+    if config.db:
+        return config.db
+
+    import httpx
+
+    url = config.url.rstrip("/") + _DATABASE_LIST_PATH
+    body = {"jsonrpc": "2.0", "method": "call", "params": {}}
+    try:
+        with httpx.Client(verify=config.verify_tls, timeout=15.0) as client:
+            response = client.post(url, json=body)
+            ## Redirects are re-POSTed by hand rather than with
+            ## follow_redirects=True: httpx implements browser semantics,
+            ## where 301/302 turn a POST into a GET, and this JSON-RPC
+            ## endpoint does not answer GET. Typing the bare domain of a
+            ## site that redirects to 'www.' is normal, so the hop must
+            ## work, but it must stay a POST.
+            for _ in range(_MAX_REDIRECTS):
+                if response.status_code not in _REDIRECT_CODES:
+                    break
+                location = response.headers.get("location")
+                if not location:
+                    break
+                response = client.post(
+                    str(response.url.join(location)), json=body
+                )
+    except httpx.HTTPError as exc:
+        raise OdooError(
+            f"cannot reach {config.url!r} to ask which database to use: "
+            f"{exc}. Set the 'db' key in the 'odoo:' section (or pass "
+            f"--odoo-db) to skip this lookup."
+        ) from exc
+
+    names: Any = None
+    if response.status_code == 200:
+        try:
+            names = response.json().get("result")
+        except ValueError:
+            names = None
+
+    if not isinstance(names, list):
+        ## Either the endpoint is disabled (list_db = False answers 500)
+        ## or something else is serving this URL.
+        raise OdooError(
+            f"{config.url!r} would not say which databases it has "
+            f"(HTTP {response.status_code}); it may have database listing "
+            f"disabled. Name it explicitly: set the 'db' key in the "
+            f"'odoo:' section, or pass --odoo-db."
+        )
+
+    names = [n for n in names if isinstance(n, str) and n]
+    if not names:
+        raise OdooError(
+            f"{config.url!r} reports no database. Check the URL, or set "
+            f"the 'db' key in the 'odoo:' section."
+        )
+    if len(names) > 1:
+        raise OdooError(
+            f"{config.url!r} hosts several databases "
+            f"({', '.join(sorted(names))}): say which one to use with the "
+            f"'db' key in the 'odoo:' section, or --odoo-db."
+        )
+    return names[0]
+
+
 def _make_default_query(config: OdooConfig) -> Query:
     """Log in to Odoo via oerpc and return a ``search_read`` query callable."""
     Odoo, ApiError, RpcError = _import_oerpc()
 
+    database = resolve_database(config)
     oe = Odoo(config.url, verify=config.verify_tls)
     try:
-        oe.session.login(config.db, config.user, config.password)
+        oe.session.login(database, config.user, config.password)
     except (ApiError, RpcError) as exc:
+        ## Name the RESOLVED database, not config.db: when it was
+        ## discovered the latter is None, and an error saying "db None"
+        ## hides the very fact the reader needs.
         where = (
             f"Odoo at {config.url!r} "
-            f"(db {config.db!r}, user {config.user!r})"
+            f"(db {database!r}, user {config.user!r})"
         )
         if _ACCESS_DENIED_RE.search(str(exc)):
             ## Summarise: the server's traceback names its own filesystem

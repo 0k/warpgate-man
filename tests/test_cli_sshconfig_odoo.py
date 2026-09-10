@@ -372,6 +372,38 @@ class TestNeedsNoWarpgateCredential:
         assert "Host jev-prod" in out
         assert f"HostName {BASTION}" in out
 
+    def test_runs_with_no_config_file_and_no_odoo_db(
+        self, tmp_path, monkeypatch, odoo_stub, capsys
+    ):
+        """--odoo-db is optional: the server names its own database.
+
+        Same standalone path as above with the flag omitted, so only the
+        database resolution differs.
+        """
+        from pathlib import Path
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            "wgman.config.DEFAULT_CONFIG_PATHS",
+            (Path(tmp_path) / "absent.yaml",),
+        )
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "s3cret")
+        monkeypatch.setattr(
+            cli.odoo, "resolve_database", lambda config: "odoo18"
+        )
+        odoo_stub(fake_query(logins=[{"id": 7, "login": "alice@example.com"}]))
+
+        rc = main([
+            "--odoo-url", "https://odoo.example.com",
+            "--odoo-user", "alice@example.com",
+            "ssh-config", "--from-odoo",
+            "--bastion", f"{BASTION}:2222",
+        ])
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "Host jev-prod" in out
 
     def test_runs_with_no_api_key_declared_at_all(
         self, tmp_path, monkeypatch, odoo_stub, capsys

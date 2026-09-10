@@ -4,6 +4,7 @@ import textwrap
 
 import pytest
 
+from wgman import odoo
 from wgman.cli import main
 from wgman.config import Config, load_config
 from wgman.exceptions import ConfigError
@@ -646,10 +647,182 @@ class TestOdooConfigSection:
     def test_incomplete_section(self, tmp_path):
         p = tmp_path / "wgman.yaml"
         p.write_text(
-            "servers: []\nodoo:\n  url: https://odoo.example.com\n"
+            "servers: []\nodoo:\n  db: mydb\n  user: sync@example.com\n"
         )
-        with pytest.raises(ConfigError, match="missing required key 'db'"):
+        with pytest.raises(ConfigError, match="missing required key 'url'"):
             load_config(p)
+
+    def test_db_is_optional(self, tmp_path):
+        """Most servers host exactly one database, which they will name on
+        request; asking the user to retype it only invites a typo whose
+        failure mode is an opaque authentication error."""
+        p = tmp_path / "wgman.yaml"
+        p.write_text(textwrap.dedent(
+            """
+            servers: []
+            odoo:
+              url: https://odoo.example.com
+              user: sync@example.com
+            """
+        ))
+        assert load_config(p).odoo.db is None
+
+
+# --------------------------------------------------------------------------- #
+# Database discovery
+#
+# Odoo answers /web/database/list unauthenticated, so the database can be
+# resolved before the login that needs it. Servers may disable the listing
+# (list_db = False), which is why 'db' stays declarable.
+# --------------------------------------------------------------------------- #
+class TestResolveDatabase:
+    def test_declared_db_is_used_without_asking_the_server(self):
+        """A declared name must short-circuit: no HTTP call may happen.
+
+        respx raises on unmocked requests, so any lookup fails this test.
+        """
+        import respx
+
+        with respx.mock:
+            cfg = OdooConfig(
+                url="https://odoo.example.com", db="mydb", user="u"
+            )
+            assert odoo.resolve_database(cfg) == "mydb"
+
+    def test_single_database_is_adopted(self):
+        import httpx
+        import respx
+
+        with respx.mock:
+            route = respx.post(
+                "https://odoo.example.com/web/database/list"
+            ).mock(return_value=httpx.Response(200, json={"result": ["odoo18"]}))
+            cfg = OdooConfig(url="https://odoo.example.com", user="u")
+
+            assert odoo.resolve_database(cfg) == "odoo18"
+            assert route.called
+
+    def test_several_databases_is_an_error_naming_them(self):
+        """Guessing among several would silently talk to the wrong data."""
+        import httpx
+        import respx
+
+        with respx.mock:
+            respx.post("https://odoo.example.com/web/database/list").mock(
+                return_value=httpx.Response(
+                    200, json={"result": ["prod", "staging"]}
+                )
+            )
+            cfg = OdooConfig(url="https://odoo.example.com", user="u")
+
+            with pytest.raises(OdooError, match="prod, staging"):
+                odoo.resolve_database(cfg)
+
+    def test_listing_disabled_is_reported_with_a_remedy(self):
+        """`list_db = False` is standard hardening, not a bug: say how to
+        proceed rather than reporting a bare HTTP failure."""
+        import httpx
+        import respx
+
+        with respx.mock:
+            respx.post("https://odoo.example.com/web/database/list").mock(
+                return_value=httpx.Response(500, text="Internal Server Error")
+            )
+            cfg = OdooConfig(url="https://odoo.example.com", user="u")
+
+            with pytest.raises(OdooError, match="'db'"):
+                odoo.resolve_database(cfg)
+
+    def test_empty_listing_is_an_error(self):
+        import httpx
+        import respx
+
+        with respx.mock:
+            respx.post("https://odoo.example.com/web/database/list").mock(
+                return_value=httpx.Response(200, json={"result": []})
+            )
+            cfg = OdooConfig(url="https://odoo.example.com", user="u")
+
+            with pytest.raises(OdooError, match="no database"):
+                odoo.resolve_database(cfg)
+
+    def test_unreachable_server_is_reported(self):
+        import httpx
+        import respx
+
+        with respx.mock:
+            respx.post("https://odoo.example.com/web/database/list").mock(
+                side_effect=httpx.ConnectError("nope")
+            )
+            cfg = OdooConfig(url="https://odoo.example.com", user="u")
+
+            with pytest.raises(OdooError, match="cannot reach"):
+                odoo.resolve_database(cfg)
+
+    @pytest.mark.parametrize("code", [301, 302, 307, 308])
+    def test_redirect_is_re_posted(self, code):
+        """Typing the bare domain of a site that redirects to www. is
+        normal, so the hop must work — and it must stay a POST.
+
+        httpx's own follow_redirects implements browser semantics, where
+        301/302 downgrade a POST to a GET; this JSON-RPC endpoint does not
+        answer GET, so the redirect must be re-POSTed by hand.
+        """
+        import httpx
+        import respx
+
+        with respx.mock:
+            respx.post("https://odoo.example.com/web/database/list").mock(
+                return_value=httpx.Response(
+                    code,
+                    headers={
+                        "Location":
+                            "https://www.odoo.example.com/web/database/list"
+                    },
+                )
+            )
+            methods = []
+
+            def record(request):
+                methods.append(request.method)
+                return httpx.Response(200, json={"result": ["odoo18"]})
+
+            respx.route(host="www.odoo.example.com").mock(side_effect=record)
+            cfg = OdooConfig(url="https://odoo.example.com", user="u")
+
+            assert odoo.resolve_database(cfg) == "odoo18"
+            assert methods == ["POST"]
+
+    def test_redirect_loop_does_not_hang(self):
+        import httpx
+        import respx
+
+        with respx.mock:
+            respx.post("https://odoo.example.com/web/database/list").mock(
+                return_value=httpx.Response(
+                    302,
+                    headers={
+                        "Location":
+                            "https://odoo.example.com/web/database/list"
+                    },
+                )
+            )
+            cfg = OdooConfig(url="https://odoo.example.com", user="u")
+
+            with pytest.raises(OdooError, match="would not say"):
+                odoo.resolve_database(cfg)
+
+    def test_trailing_slash_in_url_is_tolerated(self):
+        import httpx
+        import respx
+
+        with respx.mock:
+            respx.post("https://odoo.example.com/web/database/list").mock(
+                return_value=httpx.Response(200, json={"result": ["odoo18"]})
+            )
+            cfg = OdooConfig(url="https://odoo.example.com/", user="u")
+
+            assert odoo.resolve_database(cfg) == "odoo18"
 
 
 # --------------------------------------------------------------------------- #
@@ -785,6 +958,7 @@ class TestCliFetch:
         assert "no Odoo source" in capsys.readouterr().err
 
     def test_incomplete_cli_only_source(self, tmp_path, capsys):
+        """Only url and user are mandatory; the database can be discovered."""
         p = tmp_path / "wgman.yaml"
         p.write_text("servers:\n  - {name: p, url: u, api-key: k}\n")
         rc = main([
@@ -792,8 +966,8 @@ class TestCliFetch:
         ])
         assert rc == 2
         err = capsys.readouterr().err
-        assert "--odoo-db" in err
         assert "--odoo-user" in err
+        assert "--odoo-db" not in err
 
     def test_password_prompt_no_tty(self, tmp_path, stub_fetcher, capsys):
         p = tmp_path / "wgman.yaml"

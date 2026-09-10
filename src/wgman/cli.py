@@ -91,7 +91,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--odoo-db",
         metavar="DB",
-        help="Odoo database name (overrides the config 'odoo:' section)",
+        help=(
+            "Odoo database name (overrides the config 'odoo:' section). "
+            "Optional: when omitted the server is asked, which succeeds "
+            "when it hosts exactly one database"
+        ),
     )
     parser.add_argument(
         "--odoo-user",
@@ -202,11 +206,12 @@ def _resolve_odoo_config(
 
     base = config.odoo
     url = overrides["url"] or (base.url if base else None)
+    # 'db' is optional: an Odoo server names its own database when it hosts
+    # only one (see odoo.resolve_database), so it is not listed as missing.
     db = overrides["db"] or (base.db if base else None)
     user = overrides["user"] or (base.user if base else None)
-    missing = [k for k, v in (("url", url), ("db", db), ("user", user))
-               if not v]
-    if missing or url is None or db is None or user is None:
+    missing = [k for k, v in (("url", url), ("user", user)) if not v]
+    if missing or url is None or user is None:
         raise ConfigError(
             "incomplete Odoo source definition: missing "
             + ", ".join(f"--odoo-{k}" for k in missing)
@@ -236,9 +241,12 @@ def _ensure_odoo_password(odoo: OdooConfig) -> None:
             "no Odoo password in config and stdin is not a TTY: set the "
             "'password' key in the 'odoo:' section (use ${ENV} for secrets)"
         )
-    odoo.password = getpass.getpass(
-        f"Odoo password for {odoo.user} on {odoo.url} (db {odoo.db}): "
-    )
+    # The database may not be known yet (it is resolved at login time when
+    # not declared); saying "db None" would be worse than saying nothing.
+    where = f"{odoo.user} on {odoo.url}"
+    if odoo.db:
+        where += f" (db {odoo.db})"
+    odoo.password = getpass.getpass(f"Odoo password for {where}: ")
 
 
 def _load_odoo_state(config: Config, args: argparse.Namespace) -> bool:
@@ -479,7 +487,6 @@ def main(argv: list[str] | None = None) -> int:
             odoo_only
             and args.config is None
             and args.odoo_url
-            and args.odoo_db
             and args.odoo_user
         ):
             config = Config()

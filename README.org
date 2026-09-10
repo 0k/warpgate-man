@@ -121,7 +121,7 @@ servers:
 
 odoo:
   url: https://odoo.example.com
-  db: mydb
+  db: mydb                             # optional; see below
   user: sync@example.com
   password: ${ODOO_PASSWORD}           # omit to be prompted interactively
 
@@ -357,8 +357,23 @@ Only SSH targets come from Odoo: it describes machines, not HTTP or database
 endpoints. Add those in the YAML.
 
 =--odoo-url=, =--odoo-db= and =--odoo-user= override the =odoo:= section.
-Together they are enough to run =fetch= or =ssh-config --from-odoo= with no
-config file at all.
+=--odoo-url= and =--odoo-user= are enough to run =fetch= or =ssh-config
+--from-odoo= with no config file at all.
+
+*** The database is optional
+
+=db= may be left out, in the config and on the command line alike. Odoo
+publishes its database list on the same unauthenticated endpoint its own
+login page uses, so =warpgate-man= asks before logging in:
+
+- exactly one database — it is used, and nothing is asked;
+- several — an error listing them, because picking one would silently
+  work against the wrong data;
+- listing disabled (=list_db = False=, common hardening) — an error
+  saying to name it explicitly.
+
+Declaring =db= skips the lookup entirely, so it also serves as the answer
+to either error.
 
 ** Prune scope
 

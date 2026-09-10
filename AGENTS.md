@@ -210,6 +210,18 @@ absent from the output.
     pushing garbage credentials.
   - **roles**: every role named in `targets.roles` / `users[].roles` is
     auto-declared, so access wiring needs no separate `roles:` listing.
+- **`db` is optional** (`odoo.resolve_database`). Odoo publishes its database
+  list on `/web/database/list`, unauthenticated — the same endpoint its login
+  page uses — so it is resolved BEFORE the oerpc login that needs it. Exactly
+  one database is adopted silently; several, none, or a server with
+  `list_db = False` raise, because guessing would work against the wrong
+  data. A declared `db` short-circuits the lookup (no HTTP at all).
+  - The redirect hop is **re-POSTed by hand**, not delegated to httpx's
+    `follow_redirects`: that implements browser semantics, where 301/302
+    downgrade POST to GET, and this JSON-RPC endpoint does not answer GET.
+    `tests/test_odoo.py::TestResolveDatabase` pins all four codes.
+  - Login errors name the *resolved* database, not `config.db`, which is
+    `None` whenever it was discovered.
 - Password: config value (with `${ENV}`) or interactive `getpass` prompt on a
   TTY; no CLI flag on purpose (would leak into `ps` / shell history).
 - `fetch` prints the Odoo-sourced state as a YAML `targets:` / `roles:` /
