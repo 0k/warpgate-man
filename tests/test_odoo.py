@@ -1,5 +1,6 @@
 """Tests for the Odoo desired-state source (wgman.odoo)."""
 
+import logging
 import textwrap
 
 import pytest
@@ -329,6 +330,35 @@ class TestLoginErrorMessage:
 
 class ApiErrorStub(Exception):
     """Stands in for ``oerpc.api.common.ApiError`` (a bare Exception)."""
+
+
+class TestOerpcNoiseSuppressed:
+    """oerpc's Python-2-only xmlrpc modules must not spam stderr.
+
+    ``oerpc.api.api_modules()`` imports every API module on first session
+    use and logs an ERROR for the two that need Python 2's ``cStringIO``.
+    They are irrelevant to the JSON-RPC transport we use, but with no
+    logging configured Python's last-resort handler prints them to stderr
+    ahead of our own output.
+    """
+
+    def test_legacy_xmlrpc_scan_stays_off_stderr(self, capsys):
+        api = pytest.importorskip("oerpc.api.common")
+        # Strip the root handlers pytest installs: otherwise the record is
+        # consumed there and the last-resort handler (the one the fix must
+        # bypass) never runs, making the test pass for the wrong reason.
+        root = logging.getLogger()
+        saved = root.handlers[:]
+        root.handlers.clear()
+        api.api_modules.cache_clear()
+        try:
+            try:
+                api.Odoo("http://localhost").session
+            except Exception:
+                pass  # no live server; we only care about the import noise
+        finally:
+            root.handlers[:] = saved
+        assert "cStringIO" not in capsys.readouterr().err
 
 
 class TestSshKeysFetch:
