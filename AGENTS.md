@@ -94,6 +94,58 @@ tries the global admin token first, then the per-user `api_tokens` table.
   server-side, device-code endpoint unset). SSO users mint a personal API
   token in the web UI. Do not promise CLI SSO.
 
+## Why `ssh-config --from-odoo` exists (verified against warpgate @ c7d2841)
+
+The user-API path above needs a *personal* token, so every end user must
+log into Warpgate's web UI at least once — even though Odoo already
+created them, already pushed their SSH key, and gives them no other
+reason to go there. The obvious workaround does not exist:
+
+- **An admin CANNOT mint a token for another user.** There is no
+  `POST /users/{id}/credentials/api-tokens` on the admin API. API tokens
+  live only at the *user* API's `/profile/api-tokens`, reachable solely
+  by their owner (`warpgate-protocol-http/src/api/api_tokens.rs`). Admin
+  credential endpoints cover passwords, public keys, OTP, SSO and
+  certificates — never API tokens.
+- So Warpgate cannot be made to do the filtering on a user's behalf; it
+  is recomputed from the desired state (`access.py`).
+
+`authorized_target_ids` (`warpgate-core/src/config_providers/db.rs`) is
+just `UserRoleAssignment ⨝ TargetRoleAssignment ON role_id`, restricted
+to assignments neither revoked nor expired. No target kind is excluded
+and there is no hidden built-in target. Two consequences:
+
+- **`is_default` is NOT an authorization-time special case.** A default
+  role is *materialised* as a real join row by `grant_default_roles` at
+  user creation. So do not union "all default roles" into a user's roles
+  when reading LIVE state — but DO treat a declared `default: true` role
+  as held by everyone when reading DESIRED state, since that is what
+  Warpgate will have materialised.
+- **`GET /users/{id}/roles` also returns revoked/expired assignments**,
+  flagged by `is_active`. A live-state reader must filter on it or it
+  reports access the user no longer has.
+
+`GET /info` still yields `ports` / `external_hosts` for the global admin
+token (gated on being authenticated, not on being a user); only
+`username` is null. `--from-odoo` sidesteps this anyway by taking the
+address from `--bastion` or the config's `ssh-host`/`ssh-port`.
+
+## Odoo reality check (elabore.coop, 2026-09)
+
+The live `odoo:` section sources **machines only**: ~40
+`maintenance.equipment` targets, no `targets.roles`, no `users:`
+selections. A literal role intersection would return the empty set for
+everyone and emit empty ssh configs. Hence the rule in `access.py`: when
+NOTHING declares a role, all targets are visible; one role declared
+anywhere reinstates the intersection. Do not "simplify" this away — it is
+what makes the feature work against the real data, and
+`tests/test_access.py` pins both directions.
+
+Note `ssh_target` is the **backend** address (`root@ceres.swiss:22`). It
+must never reach a client config — the client only ever dials the
+bastion. `tests/test_cli_sshconfig_odoo.py` asserts those hostnames are
+absent from the output.
+
 ## Conventions
 
 - YAML config keys are **dash-cased** (`target-groups`, `api-key`,

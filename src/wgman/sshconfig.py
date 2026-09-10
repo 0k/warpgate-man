@@ -41,6 +41,9 @@ SSH_PROTOCOL = "ssh"
 #: Target kind (Warpgate wire format) this renderer emits stanzas for.
 SSH_TARGET_KIND = "Ssh"
 
+#: Warpgate's default SSH listener port, used when an endpoint names no port.
+DEFAULT_SSH_PORT = 2222
+
 #: Characters safe in a ``Host`` alias. OpenSSH splits on whitespace and
 #: treats ``*``, ``?`` and ``!`` as pattern syntax, so anything outside this
 #: set is replaced.
@@ -61,6 +64,25 @@ class BastionInfo:
     username: str
     host: str
     port: int
+
+    @classmethod
+    def declared(
+        cls, *, username: str, host: str, port: int = DEFAULT_SSH_PORT
+    ) -> "BastionInfo":
+        """A bastion endpoint supplied by the caller, not discovered.
+
+        Used by the Odoo-sourced path, where nobody holds a Warpgate
+        credential to ask ``GET /info``: the user knows their bastion, and
+        their identity comes from the Odoo session they authenticated.
+        """
+        if not username:
+            raise SshConfigError("no username: cannot build an ssh selector")
+        if not host:
+            raise SshConfigError(
+                "no bastion host: pass --bastion HOST[:PORT], or set "
+                "'ssh-host' on the server in the config"
+            )
+        return cls(username=username, host=host, port=port)
 
     @classmethod
     def from_info(cls, info: dict[str, Any], *, url: str) -> "BastionInfo":
@@ -112,6 +134,53 @@ def _ssh_port(info: dict[str, Any], *, url: str) -> int:
             "disabled on this server."
         )
     return int(port)
+
+
+def parse_endpoint(
+    value: str, *, default_port: int = DEFAULT_SSH_PORT
+) -> tuple[str, int]:
+    """Parse ``HOST[:PORT]`` into ``(host, port)``.
+
+    An IPv6 literal must be bracketed (``[::1]:2222``), exactly as ssh and
+    every URL syntax require: a bare ``::1`` is all colons and cannot be
+    told apart from a host/port pair.
+    """
+    text = value.strip()
+    if not text:
+        raise SshConfigError("empty bastion address: expected HOST[:PORT]")
+
+    if text.startswith("["):
+        host, sep, rest = text[1:].partition("]")
+        if not sep or not host:
+            raise SshConfigError(
+                f"malformed bracketed address {value!r}: expected [HOST] "
+                "or [HOST]:PORT"
+            )
+        port_part = rest[1:] if rest.startswith(":") else ""
+        if rest and not rest.startswith(":"):
+            raise SshConfigError(f"trailing junk after ']' in {value!r}")
+    elif text.count(":") > 1:
+        # Unbracketed IPv6: ambiguous by construction, so say exactly that.
+        raise SshConfigError(
+            f"ambiguous address {value!r}: bracket an IPv6 literal, "
+            "e.g. [2001:db8::1]:2222"
+        )
+    else:
+        host, _, port_part = text.partition(":")
+
+    if not host:
+        raise SshConfigError(f"no host in bastion address {value!r}")
+    if not port_part:
+        return host, default_port
+    try:
+        port = int(port_part)
+    except ValueError:
+        raise SshConfigError(
+            f"invalid port {port_part!r} in bastion address {value!r}"
+        ) from None
+    if not 0 < port < 65536:
+        raise SshConfigError(f"port {port} out of range (1-65535) in {value!r}")
+    return host, port
 
 
 def alias_for(name: str, prefix: str = "") -> str:

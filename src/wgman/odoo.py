@@ -341,6 +341,45 @@ def normalize_public_key(value: Any, *, where: str) -> str | None:
     return key
 
 
+def make_query(config: OdooConfig) -> Query:
+    """Log in to Odoo once and return a reusable ``search_read`` callable.
+
+    Public because a caller may need several queries against one session:
+    building a query per call would re-authenticate, and with an
+    interactive password that means re-prompting the user.
+    """
+    return _make_default_query(config)
+
+
+def resolve_login(config: OdooConfig, *, query: Query | None = None) -> str:
+    """The Warpgate username of the Odoo account in *config*.
+
+    A Warpgate user's name is its Odoo ``login`` (see
+    :func:`record_to_user`), so the caller's own bastion identity is the
+    login they just authenticated with. It is looked up rather than echoed
+    back so that a typo, or an account that cannot be read, fails here
+    with a clear message instead of silently producing an ssh config full
+    of selectors no bastion will accept.
+
+    Returns the login exactly as Odoo stores it, which is what
+    ``apply`` pushed to Warpgate — case included.
+    """
+    q = query or _make_default_query(config)
+    records = q(USERS_MODEL, [["login", "=", config.user]], ["login"])
+    if not records:
+        raise OdooError(
+            f"no {USERS_MODEL} record with login {config.user!r} on "
+            f"{config.url}: authentication succeeded, so this usually "
+            "means the account cannot read its own user record."
+        )
+    login = records[0].get("login")
+    if not login or not isinstance(login, str):
+        raise OdooError(
+            f"{USERS_MODEL} record for {config.user!r} has no usable login"
+        )
+    return login
+
+
 def fetch_state(
     config: OdooConfig,
     *,

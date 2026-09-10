@@ -301,12 +301,67 @@ nothing here weakens host-key checking.
 Only SSH targets are emitted; HTTP, MySQL, Postgres and Kubernetes targets
 are not reachable through an ssh client.
 
+*** Without a Warpgate token, from Odoo
+
+The command above asks Warpgate, so it needs a Warpgate token. When your
+users come from Odoo, that token is pure friction: they already have an
+Odoo account, their SSH key is already pushed to the bastion, and they
+have no other reason to ever open Warpgate's web UI — minting a personal
+token would be the *only* thing forcing them to.
+
+=--from-odoo= removes that step. It authenticates to *Odoo* instead, and
+builds the same config from the desired state:
+
+#+begin_src sh
+warpgate-man ssh-config --from-odoo --bastion warpgate.example.com:2222
+#+end_src
+
+Your Odoo login is both how you authenticate and who you are on the
+bastion — Warpgate usernames *are* Odoo logins (see the mapping table
+above), so nothing needs to be passed or guessed. Warpgate is not
+contacted at all.
+
+The one fact Odoo cannot supply is the *bastion's* address: Odoo knows
+the =ssh_target= of each machine, which is the backend address the
+bastion dials, and deliberately never appears in a client config. So
+name it once, either per invocation with =--bastion HOST[:PORT]=, or in
+the config so users type nothing:
+
+#+begin_src yaml
+servers:
+  - name: prod
+    url: https://warpgate.example.com:8888
+    api-key: ${WG_TOKEN}       # unused by --from-odoo
+    ssh-host: warpgate.example.com
+    ssh-port: 2222             # optional, default 2222
+#+end_src
+
+The =api-key= is not read on this path, so an unset =${WG_TOKEN}= will
+not stop it — that is the point.
+
+**** What you get, and the one caveat
+
+Which targets you see follows the same rule Warpgate applies: you reach
+a target when you and it share a role. A role marked =default: true= is
+held by everyone. If your Odoo section declares no roles at all — it
+selects machines but does not model access — every target is emitted,
+since a config silent about roles is not a config saying "nobody may
+reach anything".
+
+The caveat: this renders the *desired* state, which is what the bastion
+will look like after =apply=, not necessarily what it looks like now. If
+a target was added to Odoo but never applied, it appears here and does
+not yet work. Run =apply= first; the generated header says as much.
+
 *** Authenticating with SSO
 
 Warpgate's SSO is a browser redirect flow with no headless (device-code or
 CLI callback) variant, so =warpgate-man= cannot perform an SSO login itself.
 If your Warpgate uses SSO, log in through the web UI as usual, mint a
 personal API token there, and use it as =api-key=.
+
+This is another reason to prefer =--from-odoo= for end users: it needs no
+Warpgate credential of any kind, so the SSO limitation never bites them.
 
 * Library usage
 

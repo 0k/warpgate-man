@@ -422,12 +422,24 @@ class PruneConfig:
 # --------------------------------------------------------------------------- #
 @dataclass
 class ServerConfig:
-    """Connection details for one Warpgate server."""
+    """Connection details for one Warpgate server.
+
+    ``ssh_host``/``ssh_port`` describe the *bastion's* SSH listener — the
+    address an ssh client dials. They are optional and used only to render
+    an ssh config without asking the server (see ``ssh-config
+    --from-odoo``): the admin declares them once so end users, who hold no
+    Warpgate credential, need not discover them.
+
+    They are NOT the admin API endpoint (that is ``url``), and NOT any
+    backend machine's address.
+    """
 
     name: str
     url: str
     api_key: str
     verify_tls: bool = True
+    ssh_host: str | None = None
+    ssh_port: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], where: str = "server") -> "ServerConfig":
@@ -439,4 +451,19 @@ class ServerConfig:
             url=url,
             api_key=api_key,
             verify_tls=bool(data.get("verify-tls", True)),
+            ssh_host=data.get("ssh-host"),
+            ssh_port=_optional_port(data.get("ssh-port"), f"server {name!r}"),
         )
+
+
+def _optional_port(value: Any, where: str) -> int | None:
+    """Parse an optional TCP port, rejecting out-of-range values loudly."""
+    if value is None:
+        return None
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{where}: ssh-port must be a number, got {value!r}") from None
+    if not 0 < port < 65536:
+        raise ConfigError(f"{where}: ssh-port {port} out of range (1-65535)")
+    return port

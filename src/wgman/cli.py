@@ -25,12 +25,12 @@ import sys
 
 import yaml
 
-from . import __version__, sshconfig
+from . import __version__, access, odoo, sshconfig
 from .client import WarpgateUserClient
 from .config import Config, load_config
 from .exceptions import ConfigError, WgmanError
 from .manager import WarpgateManager
-from .models import ServerConfig
+from .models import ServerConfig, User
 from .sshconfig import BastionInfo
 from typing import Any
 
@@ -142,6 +142,25 @@ def build_parser() -> argparse.ArgumentParser:
             "the '<user>:<target>' selector, never the backend account. "
             "Needs a personal API token; the server's global admin token is "
             "bound to no user and is refused."
+        ),
+    )
+    ssh_p.add_argument(
+        "--from-odoo",
+        action="store_true",
+        help=(
+            "build the config from Odoo instead of asking Warpgate: "
+            "authenticate to Odoo as yourself and render the targets your "
+            "roles grant. Needs no Warpgate API token, only the bastion "
+            "address (--bastion, or 'ssh-host' in the config)"
+        ),
+    )
+    ssh_p.add_argument(
+        "--bastion",
+        metavar="HOST[:PORT]",
+        help=(
+            "the bastion's ssh address, for --from-odoo "
+            f"(default port {sshconfig.DEFAULT_SSH_PORT}; overrides the "
+            "config's 'ssh-host'/'ssh-port')"
         ),
     )
     ssh_p.add_argument(
@@ -276,8 +295,99 @@ def _run_fetch(config: Config, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _bastion_endpoint(
+    server: ServerConfig | None, args: argparse.Namespace
+) -> tuple[str, int]:
+    """The bastion ssh address for ``--from-odoo``: CLI over config.
+
+    The flag wins so a user with no config file can still run standalone;
+    the config keys exist so an admin can declare it once and their users
+    type nothing.
+    """
+    if args.bastion:
+        return sshconfig.parse_endpoint(args.bastion)
+    if server is not None and server.ssh_host:
+        return (
+            server.ssh_host,
+            server.ssh_port
+            if server.ssh_port is not None
+            else sshconfig.DEFAULT_SSH_PORT,
+        )
+    raise ConfigError(
+        "no bastion address: pass --bastion HOST[:PORT], or set "
+        "'ssh-host' on a server in the config file"
+    )
+
+
+def _run_ssh_config_from_odoo(config: Config, args: argparse.Namespace) -> str:
+    """Render this Odoo account's ssh config, without any Warpgate call.
+
+    The user authenticates to Odoo, which tells us who they are; the
+    desired state tells us which targets their roles grant. Warpgate is
+    never contacted — by design, since the point is to need no bastion
+    credential.
+    """
+    odoo_config = _resolve_odoo_config(config, args)
+    if odoo_config is None:
+        raise ConfigError(
+            "--from-odoo needs an Odoo source: add an 'odoo:' section to "
+            "the config, or pass --odoo-url/--odoo-db/--odoo-user"
+        )
+    _ensure_odoo_password(odoo_config)
+
+    # The bastion address is resolved BEFORE the network round-trip: a
+    # missing address is a usage error, and making the user type their
+    # password only to be told that would be gratuitous.
+    server = None
+    if config.servers:
+        server = (
+            config.server(args.server) if args.server else config.servers[0]
+        )
+    host, port = _bastion_endpoint(server, args)
+
+    # One Odoo login for both queries (whoami + state), not two.
+    query = odoo.make_query(odoo_config)
+    login = odoo.resolve_login(odoo_config, query=query)
+    state = odoo.fetch_state(odoo_config, query=query)
+
+    config.merge_targets(state.targets)
+    config.merge_users(state.users)
+    config.merge_roles(state.roles)
+
+    me = next(
+        (u for u in config.users if u.name == login),
+        User(name=login),
+    )
+    targets = access.reachable_targets(
+        me, access.ssh_targets(config.all_targets()), config.roles
+    )
+    if not targets:
+        print(
+            f"warning: no ssh target reachable by {login}",
+            file=sys.stderr,
+        )
+        return ""
+
+    info = sshconfig.BastionInfo.declared(
+        username=login, host=host, port=port
+    )
+    return sshconfig.render(
+        [access.to_render_payload(t) for t in targets],
+        info,
+        prefix=args.prefix or "",
+        header=(
+            f"# warpgate targets for {login} via {host}:{port}\n"
+            f"# generated from {odoo_config.url} (desired state) — run "
+            "'apply' first if the bastion is not up to date"
+        ),
+    )
+
+
 def _run_ssh_config(config: Config, args: argparse.Namespace) -> int:
     """Print ssh stanzas for the targets each server's api-key can reach."""
+    if args.from_odoo:
+        return _emit_ssh_config(_run_ssh_config_from_odoo(config, args), args)
+
     servers = _select_servers(config, args.server)
 
     # Target names are unique per server, not across servers: prefix with the
@@ -311,7 +421,11 @@ def _run_ssh_config(config: Config, args: argparse.Namespace) -> int:
             continue
         sections.append(rendered)
 
-    output = "\n".join(sections)
+    return _emit_ssh_config("\n".join(sections), args)
+
+
+def _emit_ssh_config(output: str, args: argparse.Namespace) -> int:
+    """Write the rendered config to ``--output`` or stdout."""
     if args.output:
         try:
             with open(args.output, "w", encoding="utf-8") as fh:
@@ -349,17 +463,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # Commands that never contact Warpgate must not require the Warpgate
+    # api-key to resolve: ``fetch`` reads only Odoo, and ``ssh-config
+    # --from-odoo`` is defined by the user holding NO bastion token. An
+    # unset ${ENV} they never read cannot be allowed to block them.
+    odoo_only = args.command == "fetch" or (
+        args.command == "ssh-config" and args.from_odoo
+    )
     try:
-        # ``fetch`` does not talk to Warpgate: tolerate unset ${ENV}
-        # references (e.g. the Warpgate api-key) in the config.
-        config = load_config(
-            args.config, strict_env=args.command != "fetch"
-        )
+        config = load_config(args.config, strict_env=not odoo_only)
     except ConfigError as exc:
-        # ``fetch`` can run without any config file when the Odoo source is
-        # fully defined on the command line.
+        # These can also run with no config file at all, when the Odoo
+        # source is fully defined on the command line.
         if (
-            args.command == "fetch"
+            odoo_only
             and args.config is None
             and args.odoo_url
             and args.odoo_db
