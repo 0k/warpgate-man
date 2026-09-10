@@ -10,6 +10,7 @@ from wgman.exceptions import ConfigError
 from wgman.models import Target
 from wgman.odoo import (
     OdooConfig,
+    OdooError,
     OdooTargetsConfig,
     OdooUserSelection,
     equipment_to_target,
@@ -240,6 +241,93 @@ class TestRecordToUser:
     def test_nominal(self):
         user = record_to_user({"id": 3, "login": "x@y.z"}, ["r"])
         assert (user.name, user.roles) == ("x@y.z", ["r"])
+
+
+class TestLoginErrorMessage:
+    """A rejected Odoo login must say so in one actionable line.
+
+    Odoo answers a bad password with an HTTP 200 carrying a full
+    server-side Python traceback (~33 lines) ending in ``AccessDenied``.
+    Relaying that verbatim buries the cause, and leaks the server's
+    filesystem layout and addon list into the terminal. The raw text
+    stays reachable on the exception chain for debugging.
+    """
+
+    ACCESS_DENIED = (
+        "(200) Odoo Server Error (path='/web/session/authenticate'):\n"
+        "  | Traceback (most recent call last):\n"
+        "  |   File \"/opt/odoo/custom/src/odoo/odoo/http.py\", line 2215\n"
+        "  |     return service_model.retrying(func, env=self.env)\n"
+        "  |   File \"/opt/odoo/auto/addons/website/models/res_users.py\"\n"
+        "  |     raise AccessDenied()\n"
+        "  | odoo.exceptions.AccessDenied: Access Denied"
+    )
+
+    def _login_failure(self, monkeypatch, exc):
+        """Drive ``_make_default_query`` with a login that raises ``exc``."""
+        import wgman.odoo as odoo_mod
+
+        class FakeSession:
+            def login(self, db, user, password):
+                raise exc
+
+        class FakeOdoo:
+            def __init__(self, url, verify=True):
+                self.session = FakeSession()
+
+        monkeypatch.setattr(
+            odoo_mod, "_import_oerpc",
+            lambda: (FakeOdoo, type(exc), RuntimeError),
+        )
+        cfg = OdooConfig(
+            url="https://odoo.example.coop", db="odoo18", user="me@example.coop"
+        )
+        with pytest.raises(OdooError) as excinfo:
+            odoo_mod._make_default_query(cfg)
+        return excinfo.value
+
+    def test_access_denied_is_one_line(self, monkeypatch):
+        err = self._login_failure(
+            monkeypatch, ApiErrorStub(self.ACCESS_DENIED)
+        )
+        assert "\n" not in str(err)
+
+    def test_access_denied_names_cause_and_remedy(self, monkeypatch):
+        err = self._login_failure(
+            monkeypatch, ApiErrorStub(self.ACCESS_DENIED)
+        )
+        message = str(err)
+        assert "password" in message
+        assert "me@example.coop" in message and "odoo18" in message
+
+    def test_access_denied_does_not_leak_server_internals(self, monkeypatch):
+        err = self._login_failure(
+            monkeypatch, ApiErrorStub(self.ACCESS_DENIED)
+        )
+        message = str(err)
+        assert "Traceback" not in message
+        assert "/opt/odoo" not in message
+
+    def test_raw_detail_survives_on_the_exception_chain(self, monkeypatch):
+        err = self._login_failure(
+            monkeypatch, ApiErrorStub(self.ACCESS_DENIED)
+        )
+        assert "AccessDenied" in str(err.__cause__)
+
+    def test_other_failures_keep_their_detail(self, monkeypatch):
+        """Only access-denied is summarised; anything else stays verbatim.
+
+        A network or protocol failure carries no traceback to hide, and
+        its detail is what makes it diagnosable.
+        """
+        err = self._login_failure(
+            monkeypatch, ApiErrorStub("could not connect to host")
+        )
+        assert "could not connect to host" in str(err)
+
+
+class ApiErrorStub(Exception):
+    """Stands in for ``oerpc.api.common.ApiError`` (a bare Exception)."""
 
 
 class TestSshKeysFetch:

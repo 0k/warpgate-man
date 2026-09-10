@@ -235,8 +235,18 @@ def equipment_to_target(
     )
 
 
-def _make_default_query(config: OdooConfig) -> Query:
-    """Log in to Odoo via oerpc and return a ``search_read`` query callable."""
+## Odoo answers a rejected login with an HTTP 200 whose body is a full
+## server-side Python traceback ending in ``AccessDenied``. This matches
+## that ending without depending on the traceback's shape.
+_ACCESS_DENIED_RE = re.compile(r"AccessDenied", re.IGNORECASE)
+
+
+def _import_oerpc() -> tuple[Any, type[BaseException], type[BaseException]]:
+    """Import the oerpc surface used here: ``(Odoo, ApiError, RpcError)``.
+
+    Isolated so the failure paths below can be exercised without oerpc
+    (and without mocking a third-party import machinery).
+    """
     try:
         from oerpc.api.common import Odoo, ApiError
         from oerpc.rpc import RpcError
@@ -245,15 +255,32 @@ def _make_default_query(config: OdooConfig) -> Query:
             "the 'oerpc' package is required for the Odoo source "
             "(pip install warpgate-man[odoo])"
         ) from exc
+    return Odoo, ApiError, RpcError
+
+
+def _make_default_query(config: OdooConfig) -> Query:
+    """Log in to Odoo via oerpc and return a ``search_read`` query callable."""
+    Odoo, ApiError, RpcError = _import_oerpc()
 
     oe = Odoo(config.url, verify=config.verify_tls)
     try:
         oe.session.login(config.db, config.user, config.password)
     except (ApiError, RpcError) as exc:
-        raise OdooError(
-            f"cannot authenticate to Odoo at {config.url!r} "
-            f"(db {config.db!r}, user {config.user!r}): {exc}"
-        ) from exc
+        where = (
+            f"Odoo at {config.url!r} "
+            f"(db {config.db!r}, user {config.user!r})"
+        )
+        if _ACCESS_DENIED_RE.search(str(exc)):
+            ## Summarise: the server's traceback names its own filesystem
+            ## layout and installed addons, and buries the one fact that
+            ## matters on its last line. It stays on ``__cause__``.
+            raise OdooError(
+                f"{where} rejected the credentials: wrong password "
+                f"(or the account cannot log in). Check the 'password' "
+                f"key in the 'odoo:' section, or the value typed at the "
+                f"prompt."
+            ) from exc
+        raise OdooError(f"cannot authenticate to {where}: {exc}") from exc
 
     def query(
         model: str, domain: list[Any], fields: list[str]
