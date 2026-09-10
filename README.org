@@ -1,85 +1,336 @@
 #+TITLE: warpgate-man
 
-Declarative manager for [[https://github.com/warp-tech/warpgate][Warpgate]]
-bastion configuration. Describe the desired state of your Warpgate servers —
-targets, target-groups, users and roles — in a single YAML file, and let
-=warpgate-man= reconcile each server to match.
+Keep a [[https://github.com/warp-tech/warpgate][Warpgate]] bastion in sync
+with an [[https://www.odoo.com/][Odoo]] database — and let its users get their
+=ssh= config from the same place.
 
-It ships both as:
+Two people use this tool, and this document is written for both:
 
-- a *command-line tool* (=warpgate-man=), and
-- a *Python library* (=wgman=) with a clean API, synchronous and
-  dependency-light, suitable for calling from another program.
+- the *manager* who runs the bastion and wants Odoo, not hand-edited
+  YAML, to be the source of truth for which machines exist and who may
+  reach them — see [[*For the manager: syncing Warpgate from Odoo][For the manager]];
+- the *Odoo user* who just wants =ssh some-machine= to work, without
+  ever touching Warpgate — see [[*For the Odoo user: setting up your ssh config][For the Odoo user]].
 
-The desired state does not have to be hand-written: warpgate-man can also
-*read it from an Odoo server*, turning your inventory of machines and users
-into Warpgate targets, users and roles.
-See [[*Sourcing the desired state from Odoo][the Odoo section]] below.
-
-* How it works
-
-Warpgate stores its targets, users and roles in a database, exposed through its
-HTTP *admin API* (=/@warpgate/admin/api=). =warpgate-man= talks to that API
-using an admin token and reconciles the live state with your desired state:
-
-- *create* what is missing,
-- *update* what differs,
-- *delete* what is not declared — only when you pass =--prune=, and even
-  then only *targets* unless you widen the scope in the =prune:= section
-  (see [[*Prune scope][Prune scope]]).
-
-** Where the desired state comes from
-
-Two sources, usable together:
-
-- the *YAML file* itself (=target-groups:=, =targets:=, =roles:=, =users:=),
-- an *Odoo server*, when the file has an =odoo:= section (or you pass
-  =--odoo-url/--odoo-db/--odoo-user=).
-
-Odoo-sourced entities are merged into the file-defined ones. A name defined
-on both sides is an error, not a silent override.
+Odoo is optional: =warpgate-man= is at bottom a declarative manager that
+reconciles one or more Warpgate servers to a YAML file, and the Odoo source
+is one way of filling that file in. The [[*Reference][Reference]] section covers
+the general form.
 
 * Installation
 
-#+begin_src sh
-uv pip install -e .
-#+end_src
-
-To use Odoo as a source of desired state, install the =odoo= extra, which
-pulls in the [[https://github.com/0k/oerpc][=oerpc=]] JSON-RPC client
-straight from its git tag:
+=warpgate-man= is a command-line tool — install it as one. It and its
+=oerpc= dependency are fetched from git, so =git= must be available.
 
 #+begin_src sh
-uv pip install -e '.[odoo]'
+uv tool install 'warpgate-man[odoo] @ git+https://github.com/0k/warpgate-man.git'
 #+end_src
 
-Without it everything else still works; only the Odoo source raises, with a
-message telling you to install the extra.
+That puts =warpgate-man= in =~/.local/bin=, in an isolated environment of
+its own: no virtualenv to create or activate. (=uv pip install= is the
+wrong verb here — it installs into the virtualenv you are *currently in*,
+and refuses to guess one.)
 
-* Configuration
+From nothing at all, on a bare Debian-based image:
 
-See [[file:examples/wgman.yaml][examples/wgman.yaml]] for a complete, annotated
-example. In short:
+#+begin_src sh
+apt-get update && apt-get install -y curl git
+curl -LsSf https://astral.sh/uv/install.sh | sh
+. "$HOME/.local/bin/env"          # puts uv, and ~/.local/bin, on PATH
+uv tool install 'warpgate-man[odoo] @ git+https://github.com/0k/warpgate-man.git'
+#+end_src
+
+The =env= line matters: uv's installer does not touch the PATH of the
+shell that ran it, so =uv= is otherwise not found until you open a new one.
+
+To run it once without installing anything:
+
+#+begin_src sh
+uvx --from 'warpgate-man[odoo] @ git+https://github.com/0k/warpgate-man.git' \
+    warpgate-man --version
+#+end_src
+
+Without uv, pip takes the same requirement string:
+
+#+begin_src sh
+pip install 'warpgate-man[odoo] @ git+https://github.com/0k/warpgate-man.git'
+#+end_src
+
+The =odoo= extra pulls in the [[https://github.com/0k/oerpc][=oerpc=]]
+JSON-RPC client. Both personas need it: the manager to read Odoo, the user
+to authenticate to it. Without the extra everything else works, and any
+Odoo command tells you to install it.
+
+From a checkout:
+
+#+begin_src sh
+uv sync --extra odoo          # add --extra dev for the test suite
+uv run warpgate-man --version
+#+end_src
+
+* For the manager: syncing Warpgate from Odoo
+
+You run a Warpgate bastion in front of a fleet of machines, and Odoo already
+knows those machines and the people who work on them. Rather than repeating
+that knowledge in Warpgate by hand, =warpgate-man= reads it from Odoo and
+reconciles the bastion to match: creating what is missing, updating what
+differs, and — only when you ask — deleting what is gone.
+
+** What Odoo must hold
+
+Three things are read. The first two come with the
+=maintenance_server_data= addon; the third is what makes access work at all,
+and it is the one your users have to supply themselves.
+
+- *Machines* are =maintenance.equipment= records whose =ssh_target= field is
+  set. That field is the address the *bastion* dials, in the form
+  =[user@]HOST[:PORT]= — =root@ceres.example.com:22=, defaulting to =root=
+  and =22=. The record's =name= becomes the target name your users will
+  type after =ssh=, so keep it short and stable.
+- *People* are =res.users=. A person's Odoo =login= becomes their Warpgate
+  username, verbatim. Which accounts become bastion users is up to your
+  selection (below).
+- *SSH public keys* are =ssh.key= records attached to a user (=user_id= +
+  =key=). *Every user must have added their public key to their Odoo
+  profile before they can log in through the bastion.* Warpgate
+  authenticates by public key: a user with no key in Odoo gets an account
+  on the bastion but cannot open a session with it.
+
+  Keys pasted with hard line-wraps are repaired at read time. Anything that
+  is not an OpenSSH public key stops the run with a loud error naming the
+  record, rather than being uploaded as a credential nobody can use.
+
+** What Warpgate must provide
+
+An *admin token* to write with. Start Warpgate with =--enable-admin-token=
+and set =WARPGATE_ADMIN_TOKEN= on the server, or mint a personal API token
+for an admin user in the web UI. Either is passed as =api-key= below and
+never written in clear text — reference an environment variable.
+
+** The configuration
+
+One file, say =wgman.yaml=:
 
 #+begin_src yaml
 servers:
   - name: prod
     url: https://warpgate.example.com:8888
     api-key: ${WG_PROD_TOKEN}
+    ssh-host: warpgate.example.com     # what your users' ssh will dial
+    ssh-port: 2222                     # optional, default 2222
+
+odoo:
+  url: https://odoo.example.com
+  db: mydb
+  user: sync@example.com
+  password: ${ODOO_PASSWORD}           # omit to be prompted interactively
+
+  # Which machines become targets, and which role reaches them.
+  targets:
+    domain: [["ssh_target", "!=", false]]   # the default
+    roles: [sysadmin]
+
+  # Which Odoo accounts become bastion users, and with which roles.
+  users:
+    - domain: [["groups_id", "in", [12]]]     # e.g. an Odoo "sysadmins" group
+      roles: [sysadmin]
+    - domain: [["login", "=", "alice@example.com"]]
+      roles: [developers]
+#+end_src
+
+Access in Warpgate is *a user and a target share a role*. Naming the same
+role on a =targets:= entry and a =users:= entry is the entire wiring; every
+role mentioned is declared for you. Leave =roles= out everywhere and no
+access is granted — every user is created, every machine is created, and
+nobody reaches anything, which is rarely what you want.
+
+=ssh-host= / =ssh-port= are not needed to sync. They exist so your users can
+[[*For the Odoo user: setting up your ssh config][build their ssh config]] from this same file without knowing the
+bastion's address by heart.
+
+Selections are *raw Odoo domains* — the =[field, operator, value]= triplets
+(with =|=, =&=, =!=) you would give =search_read=, forwarded verbatim.
+Anything Odoo can express is available.
+
+** The commands
+
+Preview what Odoo yields, without touching anything:
+
+#+begin_src sh
+warpgate-man --config wgman.yaml fetch
+#+end_src
+
+It prints the targets, users, keys and roles as YAML in exactly the shape of
+a config file, so you can read it or diff it against a previous run. Because
+it never contacts Warpgate, an unset =${WG_PROD_TOKEN}= does not stop it.
+
+See what would change on the bastion:
+
+#+begin_src sh
+warpgate-man --config wgman.yaml diff
+#+end_src
+
+Apply it:
+
+#+begin_src sh
+warpgate-man --config wgman.yaml apply
+#+end_src
+
+=apply= creates and updates. It deletes nothing unless you say so:
+
+#+begin_src sh
+warpgate-man --config wgman.yaml apply --prune
+#+end_src
+
+which removes *targets* no longer in Odoo — and only targets, by default.
+Users, roles and groups stay put, because a selection that happens to match
+nobody must not wipe the admin account. Widen this deliberately in the
+[[*Prune scope][prune section]].
+
+Keys are synchronised strictly, in one direction: a key removed from Odoo is
+removed from the bastion. A user with *no* key in Odoo is left untouched, so
+an incomplete Odoo does not lock anyone out.
+
+There is deliberately no =--odoo-password= flag: a password on the command
+line leaks into =ps= and shell history. Use =${ODOO_PASSWORD}= in the file,
+or leave the key out and type it at the prompt.
+
+* For the Odoo user: setting up your ssh config
+
+You have an Odoo account, and someone has told you the machines you work on
+now sit behind a bastion. You need two things: your key on file, and an
+=ssh= config. You never need to log into Warpgate itself.
+
+** 1. Put your public key in Odoo
+
+In your Odoo profile, add your SSH *public* key (the contents of
+=~/.ssh/id_ed25519.pub= or similar) as an =ssh.key= record. The manager's
+next sync pushes it to the bastion. Without it, the bastion knows your name
+but has no way to let you in.
+
+** 2. Generate your ssh config
+
+Install =warpgate-man= (see [[*Installation][Installation]]), then:
+
+#+begin_src sh
+warpgate-man --odoo-url https://odoo.example.com --odoo-db mydb \
+             --odoo-user you@example.com \
+             ssh-config --from-odoo --bastion warpgate.example.com:2222 \
+             -o ~/.ssh/config.d/warpgate
+#+end_src
+
+It asks for your Odoo password, and writes something like:
+
+#+begin_src conf
+# warpgate targets for you@example.com via warpgate.example.com:2222
+# generated from https://odoo.example.com (desired state) — run 'apply' first if the bastion is not up to date
+Host ceres-prod
+    HostName warpgate.example.com
+    Port     2222
+    User     you@example.com:ceres-prod
+
+Host web-01
+    HostName warpgate.example.com
+    Port     2222
+    User     you@example.com:web-01
+#+end_src
+
+Then, once, in =~/.ssh/config=:
+
+#+begin_src conf
+Include config.d/warpgate
+#+end_src
+
+and =ssh ceres-prod= works. Re-run the command whenever the fleet changes.
+
+If your manager gave you a =wgman.yaml= with the =odoo:= and =ssh-host=
+details filled in, the whole thing shortens to:
+
+#+begin_src sh
+warpgate-man --config wgman.yaml ssh-config --from-odoo -o ~/.ssh/config.d/warpgate
+#+end_src
+
+The file's =api-key= is not read on this path, so you need no Warpgate
+token and no =${WG_PROD_TOKEN}= in your environment — that is the point.
+
+** What is going on
+
+Your =ssh= client only ever talks to the *bastion*. The machine you want is
+named inside the =User= field, as =<your-login>:<target>=; the bastion reads
+it, checks that one of your roles grants that target, and dials the machine
+itself with its own credentials. So:
+
+- your Odoo login is your bastion identity — nothing to configure;
+- the machines' real addresses never appear in your config, and you never
+  need to know them;
+- =known_hosts= pins the bastion, not each machine, and nothing here weakens
+  that check.
+
+Which targets you get is the rule the bastion applies: those sharing a role
+with you. It is computed from what the manager's configuration declares, so
+it describes what the bastion looks like *after* their last =apply=. A
+machine added to Odoo this morning appears in your config but does not
+answer until the sync has run. And if that configuration declares no roles
+at all, it is not describing access, so every machine is listed — whether
+each one answers is then up to how the bastion was set up.
+
+Use =--prefix wg-= if a target name collides with a host you already have
+(=ssh wg-web-01=).
+
+* Reference
+
+Everything above is one way to use =warpgate-man=. Underneath, it is a
+declarative manager for any Warpgate server, Odoo or not.
+
+** How it works
+
+Warpgate keeps targets, users and roles in its database, reachable through
+its HTTP *admin API* (=/@warpgate/admin/api=). =warpgate-man= reads your
+desired state, reads the live state, and issues the creates, updates and
+(with =--prune=) deletes that make them match. Matching is by name;
+Warpgate's own ids are never in your file.
+
+The desired state has two sources, usable together: the YAML file's own
+=target-groups:= / =targets:= / =roles:= / =users:= sections, and the Odoo
+server named in =odoo:=. A name defined on both sides is an error, not a
+silent override.
+
+** Full YAML form
+
+See [[file:examples/wgman.yaml][examples/wgman.yaml]] for a complete annotated
+file. In short:
+
+#+begin_src yaml
+servers:
+  - name: prod
+    url: https://warpgate.example.com:8888
+    api-key: ${WG_PROD_TOKEN}
+    verify-tls: true                # optional, default true
+    ssh-host: warpgate.example.com  # optional, for ssh-config --from-odoo
+    ssh-port: 2222                  # optional, default 2222
 
 roles:
   - name: admin
+  - name: developers
+    default: true                   # auto-assigned to every user
 
-target-groups:
+target-groups:                      # purely organisational (UI folders)
   - name: databases
+    color: info
     targets:
       - name: pg-main
-        kind: ssh
+        kind: ssh                   # ssh | http | mysql | postgres | kubernetes
         host: 10.0.0.5
         port: 22
         username: postgres
-        auth: publickey
+        auth: publickey             # publickey | password | iam_role
         roles: [admin]
+
+targets:                            # ungrouped
+  - name: app-frontend
+    kind: http
+    url: http://10.0.1.10:8080
+    roles: [developers]
 
 users:
   - name: alice
@@ -88,14 +339,29 @@ users:
       - ssh-ed25519 AAAAC3Nz... alice@laptop
 #+end_src
 
-Secrets are referenced through environment variables (=${VAR}=) and
-interpolated at load time. Never write secrets in clear text.
+Secrets go through =${VAR}= and are interpolated from the environment at
+load time. Never write one in clear text.
+
+** Odoo mapping, in full
+
+| Odoo                    | Selection           | Becomes                                                   |
+|-------------------------+---------------------+-----------------------------------------------------------|
+| =maintenance.equipment= | =targets.domain=    | SSH target; =ssh_target= gives host/port/account, =name= the target name |
+| =res.users=             | each =users[].domain= | one user per =login=; roles accumulate across entries    |
+| =ssh.key=               | those users' keys   | the user's public-key credentials                         |
+| roles named above       | —                   | declared automatically                                    |
+
+Only SSH targets come from Odoo: it describes machines, not HTTP or database
+endpoints. Add those in the YAML.
+
+=--odoo-url=, =--odoo-db= and =--odoo-user= override the =odoo:= section.
+Together they are enough to run =fetch= or =ssh-config --from-odoo= with no
+config file at all.
 
 ** Prune scope
 
 =--prune= is the master switch; the optional =prune:= section says *what* it
-may delete. Without that section, =--prune= deletes *targets only* — the safe
-default, since a naive full prune would happily remove the admin user.
+may delete. Without it, only targets are pruned.
 
 #+begin_src yaml
 prune:
@@ -110,260 +376,48 @@ prune:
 Each flag turns deletion on or off for one kind; each =keep-*= list protects
 individual names even when that kind is pruned.
 
-* Tokens
+** Tokens
 
-=api-key= is *your* Warpgate token, and what you may run follows from what
-that token is:
+=api-key= is *your* Warpgate token, and what you may run follows from what it
+is:
 
-- A *personal API token* (Warpgate web UI → your profile → API tokens)
-  identifies you as a user. It is what =ssh-config= needs.
-- An *admin token* is additionally allowed on the admin API, so =diff= and
-  =apply= need one. Start Warpgate with =--enable-admin-token= and set
-  =WARPGATE_ADMIN_TOKEN= on the server, or give an admin user a personal
-  token.
+- an *admin token* (=--enable-admin-token= + =WARPGATE_ADMIN_TOKEN= on the
+  server, or a personal token of an admin user) is needed by =diff= and
+  =apply=;
+- a *personal API token* (web UI → your profile → API tokens) identifies you
+  as a user, and is what the plain =ssh-config= needs;
+- =ssh-config --from-odoo= needs *no* Warpgate token at all.
 
-Using a personal token with =apply= fails with a clear message rather than a
-bare HTTP 403.
+A personal token used with =apply= fails with a message saying what it
+lacks, not a bare HTTP 403. The server's global admin token is bound to no
+user: plain =ssh-config= refuses it rather than emitting an empty file.
 
-Note the server's *global* admin token (=--enable-admin-token=) is a machine
-credential bound to no user: Warpgate reports no username for it and grants
-it no target, so =ssh-config= refuses it.
+** =ssh-config= without Odoo
 
-* CLI usage
-
-** Administering a server
-
-#+begin_src sh
-# Show the delta between the YAML and the live server (no writes)
-warpgate-man --config wgman.yaml diff
-
-# Apply: create + update (no deletions)
-warpgate-man --config wgman.yaml apply
-
-# Apply and delete server-side targets not present in the desired state
-# (widen to other kinds with the 'prune:' section)
-warpgate-man --config wgman.yaml apply --prune
-
-# Target a single server from a multi-server config
-warpgate-man --config wgman.yaml --server prod apply
-#+end_src
-
-** Sourcing the desired state from Odoo
-
-Add an =odoo:= section and =diff= / =apply= will query that server and merge
-what it finds into the desired state, alongside whatever the file declares.
-
-#+begin_src yaml
-odoo:
-  url: https://odoo.example.com
-  db: mydb
-  user: sync@example.com
-  password: ${ODOO_PASSWORD}     # omit to be prompted interactively
-  verify-tls: true               # optional, default true
-
-  # Which machines become SSH targets, and who may reach them.
-  targets:
-    domain: [["ssh_target", "!=", false]]   # default
-    roles: [sysadmin]
-
-  # Which Odoo accounts become Warpgate users, and with which roles.
-  users:
-    - domain: [["groups_id", "in", [12]]]
-      roles: [sysadmin]
-    - domain: [["login", "=", "alice@example.com"]]
-      roles: [developers]
-#+end_src
-
-What is read, and how it maps:
-
-- *targets* — =maintenance.equipment= records matching =targets.domain=. The
-  =ssh_target= field, formatted =[user@]HOST[:PORT]= (defaulting to =root=
-  and =22=), gives host, port and backend account; the record =name= gives
-  the target name; auth is =publickey=. SSH only — Odoo describes machines,
-  not HTTP/database endpoints.
-- *users* — =res.users= records matching each =users[].domain= entry, one
-  Warpgate user per Odoo =login=. A user matching several entries
-  accumulates the roles of all of them.
-- *SSH public keys* — the =ssh.key= records belonging to those users, so
-  their keys are pushed to the bastion. Keys pasted with hard line wraps are
-  glued back together; anything that is not an OpenSSH public key is a loud
-  error, never silently uploaded.
-- *roles* — every role named in =targets.roles= or =users[].roles= is
-  auto-declared. Since access in Warpgate is "user and target share a role",
-  naming a role on both sides is all the wiring there is.
-
-Selection is expressed as *raw Odoo domains* — the same lists of
-=[field, operator, value]= triplets (with =|=, =&=, =!= operators) you would
-pass to =search_read=. They are forwarded verbatim, so any query Odoo can
-express is available.
-
-*** Previewing with =fetch=
-
-=fetch= queries Odoo and prints the result as YAML, in exactly the shape a
-config file uses — so you can read it, diff it, or paste it into a file:
-
-#+begin_src sh
-warpgate-man --config wgman.yaml fetch
-#+end_src
-
-#+begin_src yaml
-targets:
-- name: web-01
-  kind: ssh
-  host: 10.0.0.11
-  port: 22
-  username: root
-  auth: publickey
-  roles:
-  - sysadmin
-- name: db-main
-  kind: ssh
-  host: 10.0.0.12
-  port: 2222
-  username: dba
-  auth: publickey
-  roles:
-  - sysadmin
-roles:
-- name: sysadmin
-- name: developers
-users:
-- name: bob@example.com
-  roles:
-  - sysadmin
-- name: alice@example.com
-  roles:
-  - developers
-  public-keys:
-  - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB1kWyQ2 alice@laptop
-#+end_src
-
-Note =db-main= above: its =ssh_target= was =dba@10.0.0.12:2222=, which is
-where the non-default username and port come from. Note also =developers=,
-declared because a =users:= entry names it, though no target uses it yet.
-
-It writes nothing, anywhere — neither to Warpgate nor to Odoo.
-
-*** Connection details on the command line
-
-=--odoo-url=, =--odoo-db= and =--odoo-user= override the =odoo:= section, and
-together are enough to run =fetch= with no config file at all:
-
-#+begin_src sh
-warpgate-man fetch --odoo-url https://odoo.example.com \
-                   --odoo-db mydb --odoo-user sync@example.com
-#+end_src
-
-There is deliberately *no* =--odoo-password= flag: a password on the command
-line leaks into =ps= output and shell history. Put it in the config as
-=${ODOO_PASSWORD}=, or leave it out and be prompted on the terminal.
-
-Because =fetch= never contacts Warpgate, it tolerates unset =${ENV}=
-references elsewhere in the file — an unexported =WG_PROD_TOKEN= will not
-stop you from listing what Odoo holds.
-
-** Connecting to your targets
-
-=ssh-config= asks Warpgate which targets your token can reach and prints
-matching =ssh_config(5)= stanzas. It only reads, and needs no admin rights —
-admins are users too, and get their own reachable targets like anyone else.
-
-#+begin_src sh
-warpgate-man --config wgman.yaml ssh-config
-#+end_src
-
-#+begin_src conf
-Host web-01
-    HostName ssh.warpgate.example.com
-    Port     2222
-    User     alice:web-01
-#+end_src
-
-Then =ssh web-01= just works. The usual pattern is a dedicated file included
-from your ssh config:
+If you hold a personal Warpgate token, the bastion can answer directly which
+targets you reach:
 
 #+begin_src sh
 warpgate-man --config wgman.yaml ssh-config -o ~/.ssh/config.d/warpgate
-# and once, in ~/.ssh/config:  Include config.d/warpgate
 #+end_src
 
-Use =--prefix= to keep Warpgate aliases apart from your own hosts (=--prefix
-wg-= gives =ssh wg-web-01=). When several servers are queried, aliases are
-prefixed with the server name automatically, since target names are only
-unique within one server.
+This reads the *live* state — exactly what Warpgate grants right now — and
+takes the bastion address from the server itself, honouring reverse-proxy
+and NAT settings. When several servers are configured, aliases are prefixed
+with the server name, since target names are only unique within one server.
 
-What the stanzas mean: the SSH client connects to the *bastion*, and the
-target is selected through the username, encoded =<user>:<target>=. The
-backend's own account never appears — Warpgate dials it with its stored
-credentials. Likewise =known_hosts= pins the bastion, not each backend, so
-nothing here weakens host-key checking.
+The two forms emit the same stanzas; they differ only in who they ask and
+what they need to ask it.
 
-Only SSH targets are emitted; HTTP, MySQL, Postgres and Kubernetes targets
-are not reachable through an ssh client.
+Warpgate's SSO is a browser-redirect flow with no headless variant, so
+=warpgate-man= cannot log in through SSO itself. SSO users either mint a
+personal token in the web UI, or — simpler — use =--from-odoo=, which never
+touches Warpgate.
 
-*** Without a Warpgate token, from Odoo
+** Library usage
 
-The command above asks Warpgate, so it needs a Warpgate token. When your
-users come from Odoo, that token is pure friction: they already have an
-Odoo account, their SSH key is already pushed to the bastion, and they
-have no other reason to ever open Warpgate's web UI — minting a personal
-token would be the *only* thing forcing them to.
-
-=--from-odoo= removes that step. It authenticates to *Odoo* instead, and
-builds the same config from the desired state:
-
-#+begin_src sh
-warpgate-man ssh-config --from-odoo --bastion warpgate.example.com:2222
-#+end_src
-
-Your Odoo login is both how you authenticate and who you are on the
-bastion — Warpgate usernames *are* Odoo logins (see the mapping table
-above), so nothing needs to be passed or guessed. Warpgate is not
-contacted at all.
-
-The one fact Odoo cannot supply is the *bastion's* address: Odoo knows
-the =ssh_target= of each machine, which is the backend address the
-bastion dials, and deliberately never appears in a client config. So
-name it once, either per invocation with =--bastion HOST[:PORT]=, or in
-the config so users type nothing:
-
-#+begin_src yaml
-servers:
-  - name: prod
-    url: https://warpgate.example.com:8888
-    api-key: ${WG_TOKEN}       # unused by --from-odoo
-    ssh-host: warpgate.example.com
-    ssh-port: 2222             # optional, default 2222
-#+end_src
-
-The =api-key= is not read on this path, so an unset =${WG_TOKEN}= will
-not stop it — that is the point.
-
-**** What you get, and the one caveat
-
-Which targets you see follows the same rule Warpgate applies: you reach
-a target when you and it share a role. A role marked =default: true= is
-held by everyone. If your Odoo section declares no roles at all — it
-selects machines but does not model access — every target is emitted,
-since a config silent about roles is not a config saying "nobody may
-reach anything".
-
-The caveat: this renders the *desired* state, which is what the bastion
-will look like after =apply=, not necessarily what it looks like now. If
-a target was added to Odoo but never applied, it appears here and does
-not yet work. Run =apply= first; the generated header says as much.
-
-*** Authenticating with SSO
-
-Warpgate's SSO is a browser redirect flow with no headless (device-code or
-CLI callback) variant, so =warpgate-man= cannot perform an SSO login itself.
-If your Warpgate uses SSO, log in through the web UI as usual, mint a
-personal API token there, and use it as =api-key=.
-
-This is another reason to prefer =--from-odoo= for end users: it needs no
-Warpgate credential of any kind, so the SSO limitation never bites them.
-
-* Library usage
+Everything the CLI does is available from Python, synchronous and
+dependency-light, for calling from another program (Odoo included).
 
 #+begin_src python
 from wgman import WarpgateManager, Target, Role, User
@@ -372,31 +426,27 @@ mgr = WarpgateManager(url="https://warpgate.example.com:8888",
                       api_key="...")
 
 plan = mgr.reconcile(
-    roles=[Role(name="admin"), Role(name="dba")],
-    targets=[
-        Target(name="pg-main", kind="ssh", host="10.0.0.5",
-               port=22, username="postgres", auth="publickey",
-               roles=["admin", "dba"]),
-    ],
-    users=[User(name="alice", roles=["admin", "dba"])],
+    roles=[Role(name="admin")],
+    targets=[Target(name="pg-main", kind="ssh", host="10.0.0.5",
+                    username="postgres", auth="publickey",
+                    roles=["admin"])],
+    users=[User(name="alice", roles=["admin"])],
     prune=False,
 )
 print(plan)  # what was created / updated / deleted
 #+end_src
 
-You can also load a YAML file directly:
+Or from a YAML file:
 
 #+begin_src python
 from wgman import load_config, WarpgateManager
 
 config = load_config("wgman.yaml")
-server = config.server("prod")
-mgr = WarpgateManager.from_server(server)
+mgr = WarpgateManager.from_server(config.server("prod"))
 mgr.reconcile_config(config, prune=False)
 #+end_src
 
-The user side is available too — =WarpgateUserClient= reads what one user may
-reach, and =wgman.sshconfig= renders it:
+The user side too. From the live bastion, with a personal token:
 
 #+begin_src python
 from wgman import WarpgateUserClient, sshconfig
@@ -406,6 +456,21 @@ with WarpgateUserClient("https://warpgate.example.com:8888", "...") as client:
     info = BastionInfo.from_info(client.get_info(),
                                  url="https://warpgate.example.com:8888")
     print(sshconfig.render(client.list_targets(), info))
+#+end_src
+
+Or from the desired state, with no bastion credential — the same rule
+=--from-odoo= applies, as =wgman.access=:
+
+#+begin_src python
+from wgman import access, sshconfig
+from wgman.sshconfig import BastionInfo
+
+me = next(u for u in config.users if u.name == "alice@example.com")
+mine = access.reachable_targets(
+    me, access.ssh_targets(config.all_targets()), config.roles)
+info = BastionInfo.declared(username=me.name,
+                            host="warpgate.example.com", port=2222)
+print(sshconfig.render([access.to_render_payload(t) for t in mine], info))
 #+end_src
 
 * License

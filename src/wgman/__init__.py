@@ -15,11 +15,13 @@ reach, rather than what an admin declares):
 - :class:`WarpgateUserClient` — the user API (``/@warpgate/api``).
 - :mod:`wgman.sshconfig` — render an ssh client config from it
   (:class:`BastionInfo`, :func:`render`).
+- :mod:`wgman.access` — the same "who reaches what" computed from the
+  *desired* state instead, for callers holding no bastion credential.
 """
 
 from __future__ import annotations
 
-from . import sshconfig
+from . import access, sshconfig
 from .client import WarpgateClient, WarpgateUserClient
 from .config import Config, load_config
 from .exceptions import (
@@ -54,6 +56,7 @@ __all__ = [
     "Change",
     "Action",
     "sshconfig",
+    "access",
     "BastionInfo",
     "WgmanError",
     "ConfigError",
