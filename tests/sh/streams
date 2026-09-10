@@ -1,0 +1,140 @@
+# -*- mode: shell-script -*-
+# stdout carries the ssh config and NOTHING else.
+#
+# This is the whole contract of the script: `odoo-get-ssh-config >
+# ~/.ssh/config.d/warpgate` must produce a usable file. A single stray
+# progress line on stdout would corrupt it, and ssh rejects a whole config
+# over one bad line.
+
+source "$base/tests/sh/helpers.sh"
+
+# `try` runs in a fresh `bash -c`: `$(ogsc_path)` inside a try string is
+# evaluated there, so the helpers must be in scope there too.
+prefix_cmd="
+source '$base/tests/sh/helpers.sh'
+"
+
+setup() {
+    ogsc_init
+    ogsc_write_config
+}
+
+# Compared byte-for-byte against a fixture rather than with `is out`,
+# because TRIM would strip the leading indentation that ssh_config(5)
+# stanzas depend on.
+try '
+PATH="$(ogsc_path)" \
+OGSC_CALLS="$test_tmpdir/calls" \
+ODOO_PASSWORD=secret \
+"'$script_under_test'" -c "$test_tmpdir/sandbox/config.yaml" \
+    2>/dev/null > "$test_tmpdir/stdout"
+printf "%s\n" "Host jev-prod
+    HostName warpgate.example.com
+    Port     2222
+    User     you@example.com:jev-prod" > "$test_tmpdir/expected"
+diff -u "$test_tmpdir/expected" "$test_tmpdir/stdout" && echo IDENTICAL
+' "stdout is exactly the ssh config, indentation included"
+is out part "IDENTICAL"
+is errlvl 0
+
+# `2>&1 >/dev/null` swaps the streams: what reaches sunit's `out` here is
+# the script's STDERR, with its stdout discarded.
+try '
+PATH="$(ogsc_path)" \
+OGSC_CALLS="$test_tmpdir/calls" \
+ODOO_PASSWORD=secret \
+"'$script_under_test'" -c "$test_tmpdir/sandbox/config.yaml" 2>&1 >/dev/null
+' "progress is reported on stderr"
+is out part "Fetching your targets from Odoo"
+
+try '
+PATH="$(ogsc_path)" \
+OGSC_CALLS="$test_tmpdir/calls" \
+ODOO_PASSWORD=secret \
+"'$script_under_test'" -c "$test_tmpdir/sandbox/config.yaml" 2>&1 >/dev/null \
+  | grep -c "Host jev-prod" || true
+' "no stanza leaks into stderr"
+is out "0" TRIM
+
+# --output delegates to warpgate-man, which writes the file itself; stdout
+# must then be empty, so the terminal stays readable.
+try '
+PATH="$(ogsc_path)" \
+OGSC_CALLS="$test_tmpdir/calls" \
+ODOO_PASSWORD=secret \
+"'$script_under_test'" -c "$test_tmpdir/sandbox/config.yaml" \
+    -o "$test_tmpdir/out.sshconfig" 2>/dev/null
+' "--output keeps stdout empty"
+is out ""
+is errlvl 0
+
+try 'cat "$test_tmpdir/out.sshconfig"' "--output wrote the config to the file"
+is out part "Host jev-prod"
+
+# Colour decorates the conversation on stderr. An escape sequence reaching
+# the ssh config would be invisible on screen yet make ssh reject the whole
+# file -- so this must hold even when the script runs on a terminal.
+try '
+cd "$test_tmpdir"
+script -qec "PATH=\"$(ogsc_path)\" \
+OGSC_CALLS=\"$test_tmpdir/calls\" \
+ODOO_PASSWORD=secret \
+\"'$script_under_test'\" -c \"$test_tmpdir/sandbox/config.yaml\" \
+    -o \"$test_tmpdir/coloured.sshconfig\"" /dev/null < /dev/null \
+    > "$test_tmpdir/tty-out" 2>&1
+grep -q "$(printf "\033")" "$test_tmpdir/tty-out" && echo "stderr-is-coloured"
+grep -q "$(printf "\033")" "$test_tmpdir/coloured.sshconfig" \
+    || echo "config-has-no-escapes"
+' "colour reaches the terminal, never the config"
+is out 'stderr-is-coloured
+config-has-no-escapes' TRIM
+
+# NO_COLOR is the documented way out (https://no-color.org/), and a pipe
+# is not a terminal: neither may emit escapes.
+try '
+cd "$test_tmpdir"
+NO_COLOR=1 script -qec "PATH=\"$(ogsc_path)\" \
+OGSC_CALLS=\"$test_tmpdir/calls\" \
+ODOO_PASSWORD=secret \
+NO_COLOR=1 \"'$script_under_test'\" -c \"$test_tmpdir/sandbox/config.yaml\"" \
+    /dev/null < /dev/null > "$test_tmpdir/nc-out" 2>&1
+grep -q "$(printf "\033")" "$test_tmpdir/nc-out" && echo "still-coloured" \
+    || echo "no-color-respected"
+' "NO_COLOR disables the escapes"
+is out "no-color-respected" TRIM
+
+# The documented `curl ... | bash` form still puts the config on stdout.
+try '
+cd "$test_tmpdir"
+PATH="$(ogsc_path)" \
+OGSC_CALLS="$test_tmpdir/calls" \
+ODOO_PASSWORD=secret \
+bash -s -- -c "$test_tmpdir/sandbox/config.yaml" \
+    < "'$script_under_test'" > "$test_tmpdir/piped.out" 2>/dev/null
+echo "rc=$?"
+grep -q "Host jev-prod" "$test_tmpdir/piped.out" && echo "config-on-stdout"
+' "works when piped to bash, as the curl one-liner does"
+is out 'rc=0
+config-on-stdout' TRIM
+
+# Piped to an interpreter, $0 is the shell itself, so a naive script calls
+# itself "bash": messages read "bash: error:" and --help tells the reader to
+# run `bash > ~/.ssh/...`. Drive a path that actually PRINTS the name --
+# the happy path above never does, so it cannot catch this.
+try '
+cd "$test_tmpdir"
+PATH="$(ogsc_path)" \
+bash -s -- --bogus-flag < "'$script_under_test'" \
+    > /dev/null 2>"$test_tmpdir/named.err"
+echo "rc=$?"
+grep -q "^odoo-get-ssh-config: error:" "$test_tmpdir/named.err" \
+    && echo "names-itself-not-the-interpreter"
+' "names itself even when run as 'bash -s'"
+is out 'rc=2
+names-itself-not-the-interpreter' TRIM
+
+try '
+cd "$test_tmpdir"
+PATH="$(ogsc_path)" bash -s -- --version < "'$script_under_test'"
+' "--version reports the script name, not the interpreter"
+is out "odoo-get-ssh-config 0.1.0" TRIM

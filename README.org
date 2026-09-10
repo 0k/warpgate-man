@@ -255,6 +255,53 @@ token and no =${WG_PROD_TOKEN}= in your environment — that is the point.
 The key may be left out of the file altogether: a server entry needs only
 =name=, =url= and =ssh-host= to serve this command.
 
+** If you only need it once
+
+Generating an ssh config is a once-in-a-while errand, so you do not have to
+install anything for it. =uvx= fetches =warpgate-man=, runs it, and keeps
+nothing:
+
+#+begin_src sh
+uvx --from 'warpgate-man[odoo] @ git+https://github.com/0k/warpgate-man.git' \
+    warpgate-man --odoo-url https://odoo.example.com --odoo-db mydb \
+                 --odoo-user you@example.com \
+                 ssh-config --from-odoo --bastion warpgate.example.com:2222 \
+                 -o ~/.ssh/config.d/warpgate
+#+end_src
+
+It prompts for your Odoo password and writes the same file as above. All
+you need on the machine is =uv= and =git= (see [[*Installation][Installation]]) — no
+virtualenv, no config file, and no Warpgate token.
+
+The three =--odoo-*= flags are what replace the config file here, so give
+all three; with only some of them =warpgate-man= looks for a =wgman.yaml=
+and stops when there is none.
+
+** The scripted way
+
+=odoo-get-ssh-config= does all of the above on a machine that has nothing
+installed: it gets =uv= if it is missing, asks once for your Odoo server
+and your bastion, and prints the ssh config.
+
+*** Installing it
+
+#+begin_src sh
+curl -LsSfO https://raw.githubusercontent.com/0k/warpgate-man/master/scripts/odoo-get-ssh-config
+chmod +x odoo-get-ssh-config
+mv odoo-get-ssh-config ~/.local/bin/
+#+end_src
+
+*** Using it
+
+#+begin_src sh
+odoo-get-ssh-config > ~/.ssh/config.d/warpgate
+#+end_src
+
+It asks what it needs on the first run and remembers it, so later runs
+ask only for your Odoo password. Only the ssh config goes to stdout, so
+that redirection yields exactly the file =ssh= wants. Run =--help= for
+the options.
+
 ** What is going on
 
 Your =ssh= client only ever talks to the *bastion*. The machine you want is

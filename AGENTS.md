@@ -242,9 +242,36 @@ absent from the output.
   a local oerpc, override it in your own environment
   (`uv pip install -e ../oerpc` after the sync), never in `pyproject.toml`.
 
+## `scripts/odoo-get-ssh-config`
+
+A bash bootstrapper for the end user: ensures `uv`/`git`, prompts once for
+the four values (Odoo url/db/login + bastion), writes
+`~/.config/wgman/config.yaml`, then delegates to the PUBLISHED package via
+`uvx --from 'warpgate-man[odoo] @ git+https://…'`. Never runs from the
+checkout — it is meant for machines with no clone.
+
+- **stdout is the ssh config and nothing else**; all prompts/progress go to
+  stderr, and prompts are read from `/dev/tty` so `odoo-get-ssh-config >
+  ~/.ssh/config.d/warpgate` stays interactive. `tests/sh/streams` pins this.
+- The generated config declares no `api-key` (see the convention above) and
+  never stores the password — it emits `password: ${ODOO_PASSWORD}` and the
+  script supplies the variable for that run only. Written `0600`.
+- `has_tty` tests by *opening* `/dev/tty`, not by `[ -r ]`: in a container
+  the node exists but opening it fails with ENXIO, and a stat-based check
+  would print a prompt nobody can answer.
+
 ## Dev
 
 ```sh
 uv sync --extra dev --extra odoo      # oerpc comes from its public git tag
-uv run pytest
+uv run pytest                         # the library
+bin/test-sh                           # the bash script (sunit)
 ```
+
+`bin/test-sh` needs `sunit` and `shellcheck`. The sunit fixtures put the
+sandbox on a **closed** PATH (`tests/sh/helpers.sh:ogsc_path`) with the
+needed coreutils symlinked in: keeping `/usr/bin` would leave the real
+`git` visible, so a "missing tool" test would silently exercise the
+present-tool path and pass for the wrong reason. Test files also need
+`prefix_cmd` to source the helpers, because `try` runs in a fresh
+`bash -c` where they are otherwise out of scope.
